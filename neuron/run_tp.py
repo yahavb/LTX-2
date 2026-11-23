@@ -43,6 +43,27 @@ for _m in list(sys.modules.values()):
         _pd = dit_device if os.environ.get("LTX_ALL_NEURON", "0") == "1" else torch.device("cpu")
         setattr(_m, "get_device", lambda _pd=_pd: _pd)
 
+if os.environ.get("LTX_ALL_NEURON", "0") == "1":
+    # Neuron has no seeded device generator: seeded generators live on CPU and seeded draws are made there and moved
+    # (same noise as the CPU reference; a few MB once per denoising stage)
+    _Gen, _randn, _randn_like = torch.Generator, torch.randn, torch.randn_like
+
+    def _gen(device=None, *a, **k):
+        return _Gen("cpu")
+    torch.Generator = _gen
+
+    def _rn(*size, generator=None, device=None, **k):
+        if generator is None:
+            return _randn(*size, device=device, **k)
+        return _randn(*size, generator=generator, device="cpu", **k).to(device if device is not None else "cpu")
+    torch.randn = _rn
+
+    def _rnl(x, generator=None, **k):
+        if generator is None:
+            return _randn_like(x, **k)
+        return _randn(x.shape, generator=generator, dtype=k.get("dtype", x.dtype), device="cpu").to(k.get("device", x.device))
+    torch.randn_like = _rnl
+
 # --- serving shape: every model built once and kept resident; the prompt encoding cached by prompt ---
 import contextlib
 from ltx_core.loader.simple_builder import SimpleBuilder  # noqa: E402
