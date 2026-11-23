@@ -80,6 +80,19 @@ def _shard_attention(a: Attention, rank: int, world: int, group) -> None:
         a.to_gate_logits = _col(a.to_gate_logits, rank * hl, (rank + 1) * hl)
     a.to_out[0] = RowOut(a.to_out[0], lo, hi, group)
     a.heads = hl
+    # split RoPE tables are per head ([B, H, T, D/2]): keep this rank's heads
+    hlo, hhi = rank * hl, (rank + 1) * hl
+    fwd = a.forward
+
+    def _sl(pe):
+        if pe is None:
+            return None
+        return tuple(t[:, hlo:hhi] if (t.ndim == 4 and t.shape[1] == h) else t for t in pe)
+
+    def forward(x, context=None, mask=None, pe=None, k_pe=None, perturbation_mask=None, all_perturbed=False):
+        return fwd(x, context=context, mask=mask, pe=_sl(pe), k_pe=_sl(k_pe), perturbation_mask=perturbation_mask,
+                   all_perturbed=all_perturbed)
+    a.forward = forward
 
 
 def _shard_ff(f: FeedForward, rank: int, world: int, group) -> None:
