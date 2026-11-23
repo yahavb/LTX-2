@@ -109,10 +109,15 @@ def _cache_prompt(cls):
             dev0 = self._device
             if os.environ.get("LTX_TE_NEURON", "0") != "1":
                 self._device = torch.device("cpu")
+            dt0 = self._dtype
+            if os.environ.get("LTX_TE_FP32", "0") == "1":   # gate reference: the text encoder in fp32 on CPU
+                self._dtype = torch.float32
             try:
                 _prompts[key] = f(self, prompts, *a, **k)
             finally:
-                self._device = dev0
+                self._device, self._dtype = dev0, dt0
+            if os.environ.get("LTX_TE_DUMP") and rank == 0:   # gate: the prompt encoding, after the timers
+                torch.save(_move(_prompts[key], torch.device("cpu")), os.environ["LTX_TE_DUMP"])
         if os.environ.get("LTX_ALL_NEURON", "0") == "1":
             return _move(_prompts[key], dit_device)
         return _prompts[key]
