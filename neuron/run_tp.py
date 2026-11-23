@@ -188,7 +188,87 @@ def _step_graph_loop(sigmas, video_state, audio_state, transformer, denoiser, v_
     return _SM.VideoAudio(video_state, audio_state)
 
 
+def _anc_latent(state, denoised, s2, noise, terminal, eta, s_noise, model_dtype):
+    """One ancestral-Euler step for one modality, as in _ancestral_euler_denoising_loop + EulerAncestralDiffusionStep,
+    with sigma kept a device tensor. Returns only the new latent."""
+    if state is None or denoised is None:
+        return None
+    from ltx_pipelines.utils.helpers import post_process_latent
+    mask, clean = state.denoise_mask.tensor, state.clean_latent
+    d = post_process_latent(denoised.float(), mask, clean)
+    if terminal:
+        return d.to(model_dtype)
+    sig, nxt = s2[0].float(), s2[1].float()
+    x = state.latent.float()
+    sigma_down = nxt * (1.0 + (nxt / sig - 1.0) * eta)
+    r = sigma_down / sig
+    x_next = r * x + (1.0 - r) * d
+    if eta > 0:
+        a_next, a_down = 1.0 - nxt, 1.0 - sigma_down
+        coeff = (nxt ** 2 - sigma_down ** 2 * a_next ** 2 / a_down ** 2).clamp(min=0) ** 0.5
+        x_next = (a_next / a_down) * x_next + noise.float() * s_noise * coeff
+        x_next = post_process_latent(x_next, mask, clean)
+    return x_next.to(model_dtype)
+
+
+_orig_anc = _SM.euler_ancestral_denoising_loop
+
+
+def _anc_step_graph_loop(sigmas, video_state, audio_state, transformer, denoiser, v_context=None, a_context=None,
+                         noise_seed=-1, new_noise_fn=_SM._get_plain_noise, model_dtype=torch.bfloat16, eta=1.0,
+                         s_noise=1.0):
+    """LTX_STEP_GRAPH=1 for the distilled pipeline's ancestral loop: the per-step noise is drawn up front from the
+    same seeded generator in the stock order (video then audio, per non-terminal step), and each step (denoiser +
+    ancestral update + mask) is one compiled graph."""
+    if new_noise_fn is not _SM._get_plain_noise:
+        return _orig_anc(sigmas, video_state, audio_state, transformer, denoiser, v_context, a_context,
+                         noise_seed=noise_seed, new_noise_fn=new_noise_fn, model_dtype=model_dtype, eta=eta,
+                         s_noise=s_noise)
+    from dataclasses import replace as _rp
+    dev = _SM._present_state(video_state, audio_state).latent.device
+    host = sigmas.detach().float().cpu()
+    sched = sigmas.to(dev)
+    gen = torch.Generator("cpu").manual_seed(noise_seed)
+    n = len(host) - 1
+    steps = []
+    for i in range(n):
+        terminal = bool(host[i + 1] == 0)
+        nv = na = None
+        if not terminal and eta > 0:
+            if video_state is not None:
+                nv = torch.randn(video_state.latent.shape, generator=gen, dtype=video_state.latent.dtype).to(dev)
+            if audio_state is not None:
+                na = torch.randn(audio_state.latent.shape, generator=gen, dtype=audio_state.latent.dtype).to(dev)
+        steps.append((sched[i:i + 2].clone(), nv, na, terminal))
+        if terminal:
+            break
+
+    def body(vs, as_, s2, nv, na, vc, ac, terminal):
+        vr, ar = denoiser(transformer, vs, as_, s2, 0, vc, ac)
+        dv = vr.denoised if vr is not None else None
+        da = ar.denoised if ar is not None else None
+        return (_anc_latent(vs, dv, s2, nv, terminal, eta, s_noise, model_dtype),
+                _anc_latent(as_, da, s2, na, terminal, eta, s_noise, model_dtype))
+    key = ("anc", id(transformer))
+    if key not in _cached:
+        _cached[key] = torch.compile(body, backend="neuron", dynamic=False, fullgraph=_FG)
+    cb = _cached[key]
+    for i, (s2, nv, na, terminal) in enumerate(steps):
+        vl, al = cb(video_state, audio_state, s2, nv, na, v_context, a_context, terminal)
+        if vl is not None:
+            video_state = _rp(video_state, latent=vl)
+        if al is not None:
+            audio_state = _rp(audio_state, latent=al)
+        if os.environ.get("LTX_STEP_DEBUG") == "1" and rank == 0 and vl is not None:
+            f = vl.float()
+            print(f"[STEP] {i} mean {f.mean().item():.4f} std {f.std().item():.4f} nan {int(torch.isnan(f).sum())}",
+                  flush=True)
+    return _SM.VideoAudio(video_state, audio_state)
+
+
 if os.environ.get("LTX_STEP_GRAPH", "0") == "1":
+    _SM.euler_ancestral_denoising_loop = _anc_step_graph_loop
+    D.euler_ancestral_denoising_loop = _anc_step_graph_loop
     _SM.euler_denoising_loop = _step_graph_loop
     DS.euler_denoising_loop = _step_graph_loop
 
