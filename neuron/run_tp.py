@@ -141,14 +141,15 @@ _orig_build = DS.DiffusionStage._build_transformer
 # passes), the checks return the constant False inside the graph; otherwise the call fails instead of running wrong.
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig as _BPC  # noqa: E402
 _any0, _all0 = _BPC.any_in_batch, _BPC.all_in_batch
-_BPC.any_in_batch = lambda self, t, b: False if getattr(self, "_none_perturbed", False) else _any0(self, t, b)
-_BPC.all_in_batch = lambda self, t, b: False if getattr(self, "_none_perturbed", False) else _all0(self, t, b)
+_NOPERT = [False]   # module level: batch_split copies the config, so a per-object flag would be lost
+_BPC.any_in_batch = lambda self, t, b: False if _NOPERT[0] else _any0(self, t, b)
+_BPC.all_in_batch = lambda self, t, b: False if _NOPERT[0] else _all0(self, t, b)
 
 
 def _mark_unperturbed(perturbations):
     if perturbations is not None:
         assert bool((perturbations._block_masks.host_tensor != 0).all()), "perturbed batch under LTX_COMPILE=model"
-        perturbations._none_perturbed = True
+    _NOPERT[0] = True
 
 
 def _te_patch(cls):
