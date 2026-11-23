@@ -451,6 +451,9 @@ def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
             dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False, fullgraph=_FG)
         _vdec["dec"] = dec
     dec = _vdec["dec"]
+    if rank == 0:   # the latent the VAE gets: a NaN / zero latent is a broken stage upstream, not a VAE problem
+        lf = latent.float()
+        print(f"[LATENT] mean {lf.mean().item():.4f} std {lf.std().item():.4f} nan {int(torch.isnan(lf).sum())}", flush=True)
     with torch.no_grad():
         chunks = dec.decode_video(latent.to(dit_device, torch.bfloat16), None, generator)
         return iter([c.cpu() for c in chunks])
