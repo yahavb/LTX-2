@@ -59,7 +59,7 @@ class AudioDecoder:
         # metrics). On CUDA/CPU it is stored in bf16 and autocast upcasts per-op to
         # save memory; MPS has no fp32 autocast, so store it in fp32 directly and
         # avoid the per-call cast. Negligible footprint for this small model.
-        vocoder_dtype = torch.float32 if self._device.type == "mps" else self._dtype
+        vocoder_dtype = torch.float32 if self._device.type in ("mps", "cpu", "neuron") else self._dtype  # neuron port: no CUDA autocast to upcast the vocoder
         with (
             gpu_model(
                 self._decoder_builder.build(device=self._device, dtype=self._dtype).eval(),
