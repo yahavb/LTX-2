@@ -177,6 +177,28 @@ if rank != 0:
     if "--output-path" in argv:
         argv[argv.index("--output-path") + 1] = f"/tmp/ltx_rank{rank}.mp4"
     sys.argv = [sys.argv[0]] + argv
+# --- the conv video decoder on this rank's Neuron core, compiled once (LTX_VAE_NEURON=1, the default) ---
+from ltx_pipelines.utils.blocks import video_decoder as VDm  # noqa: E402
+_vdec = {}
+_orig_vd_call = VDm.VideoDecoder.__call__
+
+
+def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
+    if DIT_DEV != "neuron" or os.environ.get("LTX_VAE_NEURON", "1") != "1":
+        return _orig_vd_call(self, latent, tiling_config, generator, **kw)
+    if "dec" not in _vdec:
+        from ltx_core.model.video_vae.memory_efficient_decode import disable_memory_efficient_decode
+        dec = self._prepared_builder().build(device=dit_device, dtype=torch.bfloat16).eval()
+        dec = disable_memory_efficient_decode(dec)
+        dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False)
+        _vdec["dec"] = dec
+    dec = _vdec["dec"]
+    with torch.no_grad():
+        chunks = dec.decode_video(latent.to(dit_device, torch.bfloat16), None, generator)
+        return iter([c.cpu() for c in chunks])
+
+
+VDm.VideoDecoder.__call__ = _vd_call
 _enc = D.encode_media_segments
 
 
