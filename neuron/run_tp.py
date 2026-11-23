@@ -134,6 +134,8 @@ def _cache_prompt(cls):
     cls.__call__ = w
 
 _cached = {}
+# LTX_FULLGRAPH=1 (default): every compiled module must be one graph; a graph break is an error, never a silent split
+_FG = os.environ.get("LTX_FULLGRAPH", "1") == "1"
 _orig_build = DS.DiffusionStage._build_transformer
 
 # LTX_COMPILE=model: the perturbation checks read a host tensor (bool(...)): one graph break per block. Before each
@@ -171,7 +173,7 @@ def _te_patch(cls):
         m = m.to(dit_device)
         for mod in m.modules():
             if type(mod).__name__ == "Gemma4TextDecoderLayer":
-                mod.forward = torch.compile(mod.forward, backend="neuron", dynamic=False)
+                mod.forward = torch.compile(mod.forward, backend="neuron", dynamic=False, fullgraph=_FG)
         if rank == 0:
             print(f"[te] gemma on {dit_device} in {time.time() - t0:.1f}s", flush=True)
         _cached["te"] = m
@@ -191,7 +193,7 @@ def _build_transformer(self, *, device=None, **kw):
         m = m.to(dit_device)
         if os.environ.get("LTX_COMPILE", "blocks") == "model":
             # LTX_COMPILE=model: the whole DiT forward (embeddings, AdaLN, RoPE, every block, the head) as one graph
-            _cf = torch.compile(m.forward, backend="neuron", dynamic=False)
+            _cf = torch.compile(m.forward, backend="neuron", dynamic=False, fullgraph=_FG)
 
             def _fw(video, audio, perturbations, _cf=_cf):
                 _mark_unperturbed(perturbations)
@@ -202,7 +204,7 @@ def _build_transformer(self, *, device=None, **kw):
                 blocks = getattr(mod, "transformer_blocks", None)
                 if blocks is not None:
                     for b in blocks:
-                        b.forward = torch.compile(b.forward, backend="neuron", dynamic=False)
+                        b.forward = torch.compile(b.forward, backend="neuron", dynamic=False, fullgraph=_FG)
         m = _wrap_io(m)
     if rank == 0:
         print(f"[tp] DiT built, sharded and placed in {time.time() - t0:.1f} s on {dit_device}", flush=True)
@@ -315,7 +317,7 @@ def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
         from ltx_core.model.video_vae.memory_efficient_decode import disable_memory_efficient_decode
         dec = self._prepared_builder().build(device=dit_device, dtype=torch.bfloat16).eval()
         dec = disable_memory_efficient_decode(dec)
-        dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False)
+        dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False, fullgraph=_FG)
         _vdec["dec"] = dec
     dec = _vdec["dec"]
     with torch.no_grad():
@@ -342,7 +344,7 @@ def _up_call(self, latent):
     if "up" not in _res:
         enc = self._encoder_builder.build(device=dit_device, dtype=self._dtype).eval()
         up = self._upsampler_builder.build(device=dit_device, dtype=self._dtype).eval()
-        up.forward = torch.compile(up.forward, backend="neuron", dynamic=False)
+        up.forward = torch.compile(up.forward, backend="neuron", dynamic=False, fullgraph=_FG)
         _res["up"] = (enc, up)
     enc, up = _res["up"]
     with torch.no_grad():
@@ -356,8 +358,8 @@ def _ad_call(self, latent):
     if "ad" not in _res:
         dec = self._decoder_builder.build(device=dit_device, dtype=self._dtype).eval()
         voc = self._vocoder_builder.build(device=dit_device, dtype=torch.float32).eval()
-        dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False)
-        voc.forward = torch.compile(voc.forward, backend="neuron", dynamic=False)
+        dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False, fullgraph=_FG)
+        voc.forward = torch.compile(voc.forward, backend="neuron", dynamic=False, fullgraph=_FG)
         _res["ad"] = (dec, voc)
     dec, voc = _res["ad"]
     with torch.no_grad():
