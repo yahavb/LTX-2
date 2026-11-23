@@ -191,7 +191,7 @@ def _build_transformer(self, *, device=None, **kw):
     if DIT_DEV == "neuron":
         tp.shard_transformer(m, rank, world, dist.group.WORLD if world > 1 else None)
         m = m.to(dit_device)
-        if os.environ.get("LTX_COMPILE", "blocks") == "model":
+        if os.environ.get("LTX_COMPILE", "model") == "model":
             # LTX_COMPILE=model: the whole DiT forward (embeddings, AdaLN, RoPE, every block, the head) as one graph
             _cf = torch.compile(m.forward, backend="neuron", dynamic=False, fullgraph=_FG)
 
