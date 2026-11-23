@@ -404,16 +404,18 @@ def _rep_pad(x, left, right):
 def _up_forward(self, x):
     b, c, _ = x.shape
     s, k = self.stride, self.kernel_size
-    assert k % s == 0
-    j = k // s
+    j = -(-k // s)                                                              # ceil(K / s)
     x = _rep_pad(x, self.pad, self.pad)
+    lp = x.shape[-1]
     f = self.filter.to(dtype=x.dtype, device=x.device).reshape(-1)
+    if j * s > k:                                                               # zero taps: same sums
+        f = torch.cat([f, f.new_zeros(j * s - k)])
     w = torch.stack([f[p::s].flip(0) for p in range(s)])                         # [s, J]
     w = w.unsqueeze(0).expand(c, s, j).reshape(c * s, 1, j)
-    h = torch.nn.functional.conv1d(torch.nn.functional.pad(x, (j - 1, j - 1)), w, groups=c)   # [B, C*s, L']
+    h = torch.nn.functional.conv1d(torch.nn.functional.pad(x, (j - 1, j - 1)), w, groups=c)   # [B, C*s, Lp+J-1]
     y = h.view(b, c, s, -1).transpose(2, 3).reshape(b, c, -1)
-    y = self.ratio * y
-    return y[..., self.pad_left: -self.pad_right]
+    n = (lp - 1) * s + k                                                        # conv_transpose1d output length
+    return self.ratio * y[..., self.pad_left: n - self.pad_right]
 
 
 def _lp_forward(self, x):
