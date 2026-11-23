@@ -285,6 +285,10 @@ def enable_sequence_parallel(model: torch.nn.Module, rank: int, world: int, grou
                 if video is None:
                     return _pb(video, audio, perturbations)
                 T = video.x.shape[1]
+                if T < int(os.environ.get("LTX_SP_MIN_T", "1024")):
+                    # the trace: SP made the 384-token stage-1 step slower (78 -> 84 ms), the 1536-token stage-2
+                    # step faster (198 -> 150 ms); below the threshold the plain TP path runs
+                    return _pb(video, audio, perturbations)
                 assert T % world == 0, f"{T} video tokens over {world} ranks"
                 _SP.update(on=True, T=T, Tl=T // world, lo=rank * (T // world), group=group)
                 cm = video.cross_attn_perturbation_mask if hasattr(video, "cross_attn_perturbation_mask") else None
