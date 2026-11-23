@@ -146,22 +146,21 @@ _orig_build = DS.DiffusionStage._build_transformer
 from ltx_pipelines.utils import samplers as _SM  # noqa: E402
 
 
-def _euler_state(state, denoised, s2):
-    """_step_state + EulerDiffusionStep with sigma kept a device tensor. The stock to_velocity calls sigma.item()
-    (a host round trip, data-dependent under compile: the step graph produced an all-NaN latent). Same formulas."""
+def _euler_latent(state, denoised, s2):
+    """post_process + EulerDiffusionStep with sigma kept a device tensor (the stock to_velocity calls sigma.item()).
+    Returns only the new latent: the graph's outputs never alias its inputs. Same formulas."""
     if state is None or denoised is None:
-        return state
+        return None
     from ltx_pipelines.utils.helpers import post_process_latent
-    from dataclasses import replace as _rp
     d = post_process_latent(denoised, state.denoise_mask.tensor, state.clean_latent)
     x = state.latent
     sig, nxt = s2[0].float(), s2[1].float()
     v = ((x.float() - d.float()) / sig).to(x.dtype)
-    return _rp(state, latent=(x.float() + v.float() * (nxt - sig)).to(x.dtype))
+    return (x.float() + v.float() * (nxt - sig)).to(x.dtype)
 
 
 def _step_graph_loop(sigmas, video_state, audio_state, transformer, denoiser, v_context=None, a_context=None):
-    stepper = _SM.EulerDiffusionStep()
+    from dataclasses import replace as _rp
     dev = _SM._present_state(video_state, audio_state).latent.device
     sched = sigmas.to(dev)
     pairs = [sched[i:i + 2].clone() for i in range(len(sched) - 1)]
@@ -170,13 +169,22 @@ def _step_graph_loop(sigmas, video_state, audio_state, transformer, denoiser, v_
         vr, ar = denoiser(transformer, vs, as_, s2, 0, vc, ac)
         dv = vr.denoised if vr is not None else None
         da = ar.denoised if ar is not None else None
-        return _euler_state(vs, dv, s2), _euler_state(as_, da, s2)
+        return _euler_latent(vs, dv, s2), _euler_latent(as_, da, s2)
     key = ("step", id(transformer))
     if key not in _cached:
-        _cached[key] = torch.compile(body, backend="neuron", dynamic=False, fullgraph=_FG)
+        _cached[key] = body if os.environ.get("LTX_STEP_EAGER") == "1" else \
+            torch.compile(body, backend="neuron", dynamic=False, fullgraph=_FG)
     cb = _cached[key]
-    for s2 in pairs:
-        video_state, audio_state = cb(video_state, audio_state, s2, v_context, a_context)
+    for i, s2 in enumerate(pairs):
+        vl, al = cb(video_state, audio_state, s2, v_context, a_context)
+        if vl is not None:
+            video_state = _rp(video_state, latent=vl)
+        if al is not None:
+            audio_state = _rp(audio_state, latent=al)
+        if os.environ.get("LTX_STEP_DEBUG") == "1" and rank == 0 and vl is not None:
+            f = vl.float()
+            print(f"[STEP] {i} sigma {pairs[i].cpu().tolist()} mean {f.mean().item():.4f} std {f.std().item():.4f} "
+                  f"nan {int(torch.isnan(f).sum())}", flush=True)
     return _SM.VideoAudio(video_state, audio_state)
 
 
