@@ -69,6 +69,16 @@ if os.environ.get("LTX_ALL_NEURON", "0") == "1":
         return _randn(x.shape, generator=generator, dtype=k.get("dtype", x.dtype), device="cpu").to(k.get("device", x.device))
     torch.randn_like = _rnl
 
+    # eager torch.lerp does not lower on Neuron: a + w * (b - a), the same formula
+    _lerp = torch.lerp
+
+    def _lp(start, end, weight, *a, **k):
+        if start.device.type == "cpu":
+            return _lerp(start, end, weight, *a, **k)
+        return start + weight * (end - start)
+    torch.lerp = _lp
+    torch.Tensor.lerp = lambda self, end, weight: _lp(self, end, weight)
+
 # --- serving shape: every model built once and kept resident; the prompt encoding cached by prompt ---
 import contextlib
 from ltx_core.loader.simple_builder import SimpleBuilder  # noqa: E402
