@@ -38,7 +38,10 @@ for _m in list(sys.modules.values()):
         if hasattr(_m, _n):
             setattr(_m, _n, lambda device=None: _BUDGET)
     if hasattr(_m, "get_device"):
-        setattr(_m, "get_device", lambda: torch.device("cpu"))
+        # LTX_ALL_NEURON=1: the whole pipeline (latents, scheduler, every stage but the cached text encoder) on this
+        # rank's core; otherwise the glue runs on CPU and only the heavy stages are on Neuron
+        _pd = dit_device if os.environ.get("LTX_ALL_NEURON", "0") == "1" else torch.device("cpu")
+        setattr(_m, "get_device", lambda _pd=_pd: _pd)
 
 # --- serving shape: every model built once and kept resident; the prompt encoding cached by prompt ---
 import contextlib
@@ -77,7 +80,14 @@ def _cache_prompt(cls):
     def w(self, prompts, *a, **k):
         key = (tuple(prompts), repr(sorted(k.items())))
         if key not in _prompts:
-            _prompts[key] = f(self, prompts, *a, **k)
+            dev0 = self._device
+            self._device = torch.device("cpu")
+            try:
+                _prompts[key] = f(self, prompts, *a, **k)
+            finally:
+                self._device = dev0
+        if os.environ.get("LTX_ALL_NEURON", "0") == "1":
+            return _move(_prompts[key], dit_device)
         return _prompts[key]
     cls.__call__ = w
 
@@ -148,7 +158,7 @@ def _wrap_io(m):
     @functools.wraps(f)
     def w(*a, **k):
         out = f(*_move(a, dit_device), **_move(k, dit_device))
-        return _move(out, torch.device("cpu"))
+        return out if os.environ.get("LTX_ALL_NEURON", "0") == "1" else _move(out, torch.device("cpu"))
     m.forward = w
     return m
 
@@ -226,7 +236,8 @@ def _up_call(self, latent):
         _res["up"] = (enc, up)
     enc, up = _res["up"]
     with torch.no_grad():
-        return upsample_video(latent=latent.to(dit_device, self._dtype), video_encoder=enc, upsampler=up).cpu()
+        out = upsample_video(latent=latent.to(dit_device, self._dtype), video_encoder=enc, upsampler=up)
+        return out if os.environ.get("LTX_ALL_NEURON", "0") == "1" else out.cpu()
 
 
 def _ad_call(self, latent):
