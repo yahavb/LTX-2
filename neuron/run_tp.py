@@ -1,0 +1,144 @@
+"""LTX-2.5 distilled pipeline with the DiT tensor-parallel on Neuron; every other stage on CPU (bring-up).
+    torchrun --nproc_per_node=4 neuron/run_tp.py <ltx_pipelines.distilled CLI args>
+Every rank runs the same pipeline (same seed, so the CPU stages agree); only the DiT is sharded over the ranks and
+placed on neuron:<local rank>, each transformer block compiled once with torch.compile(backend="neuron"). Rank 0
+writes the video. Prints per-stage times ([STAGE]) on rank 0. LTX_DIT_DEVICE=cpu keeps the DiT on CPU (reference).
+"""
+import collections
+import functools
+import os
+import sys
+import time
+
+import torch
+import torch.distributed as dist
+
+rank, world, local = (int(os.environ.get(k, d)) for k, d in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0)))
+DIT_DEV = os.environ.get("LTX_DIT_DEVICE", "neuron")
+if DIT_DEV == "neuron":
+    import torch_neuronx  # noqa: F401
+    torch.neuron.set_device(local)
+    dist.init_process_group(backend="neuron", rank=rank, world_size=world)
+    dit_device = torch.device(f"neuron:{local}")
+else:
+    dit_device = torch.device("cpu")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tp  # noqa: E402
+
+import ltx_core.devices as devs  # noqa: E402
+import ltx_pipelines.distilled as D  # noqa: E402
+from ltx_pipelines.utils.blocks import diffusion_stage as DS  # noqa: E402
+
+# every stage but the DiT on CPU; the CPU decode needs a memory budget for its tiling planner
+_BUDGET = 64 * 2**30
+for _m in list(sys.modules.values()):
+    if _m is None or not getattr(_m, "__name__", "").startswith(("ltx_core", "ltx_pipelines")):
+        continue
+    for _n in ("cuda_activation_budget_bytes", "cuda_allocatable_bytes", "activation_budget_bytes", "allocatable_bytes"):
+        if hasattr(_m, _n):
+            setattr(_m, _n, lambda device=None: _BUDGET)
+    if hasattr(_m, "get_device"):
+        setattr(_m, "get_device", lambda: torch.device("cpu"))
+
+_cached = {}
+_orig_build = DS.DiffusionStage._build_transformer
+
+
+def _build_transformer(self, *, device=None, **kw):
+    """Build on CPU once, shard over the TP group, move to this rank's core, compile every block; reuse after."""
+    key = id(self)
+    if key in _cached:
+        return _cached[key]
+    t0 = time.time()
+    m = _orig_build(self, device=torch.device("cpu"), **kw)
+    if DIT_DEV == "neuron":
+        tp.shard_transformer(m, rank, world, dist.group.WORLD if world > 1 else None)
+        m = _wrap_io(m.to(dit_device))
+        for mod in m.modules():
+            blocks = getattr(mod, "transformer_blocks", None)
+            if blocks is not None:
+                for b in blocks:
+                    b.forward = torch.compile(b.forward, backend="neuron", dynamic=False)
+    if rank == 0:
+        print(f"[tp] DiT built, sharded and placed in {time.time() - t0:.1f} s on {dit_device}", flush=True)
+    _cached[key] = m
+    return m
+
+
+DS.DiffusionStage._build_transformer = _build_transformer
+
+# keep the DiT resident across calls (the pipeline frees models after each use)
+_orig_lifetime = DS.DiffusionStage._transformer_lifetime
+
+
+def _lifetime(self, transformer):
+    import contextlib
+    return contextlib.nullcontext(transformer)
+
+
+DS.DiffusionStage._transformer_lifetime = _lifetime
+
+# the DiT runs on neuron but receives CPU tensors from the CPU stages: move inputs in, outputs out
+import dataclasses
+
+
+def _move(x, dev):
+    if isinstance(x, torch.Tensor):
+        return x.to(dev)
+    if dataclasses.is_dataclass(x) and not isinstance(x, type):
+        return dataclasses.replace(x, **{f.name: _move(getattr(x, f.name), dev) for f in dataclasses.fields(x) if f.init})
+    if isinstance(x, tuple) and hasattr(x, "_fields"):
+        return type(x)(*(_move(v, dev) for v in x))
+    if isinstance(x, (list, tuple)):
+        return type(x)(_move(v, dev) for v in x)
+    if isinstance(x, dict):
+        return {k: _move(v, dev) for k, v in x.items()}
+    return x
+
+
+def _wrap_io(m):
+    f = m.forward
+
+    @functools.wraps(f)
+    def w(*a, **k):
+        out = f(*_move(a, dit_device), **_move(k, dit_device))
+        return _move(out, torch.device("cpu"))
+    m.forward = w
+    return m
+
+T = collections.defaultdict(float)
+N = collections.Counter()
+
+
+def timed(cls, name):
+    f = cls.__call__
+
+    @functools.wraps(f)
+    def w(self, *a, **k):
+        t0 = time.perf_counter()
+        r = f(self, *a, **k)
+        T[name] += time.perf_counter() - t0
+        N[name] += 1
+        return r
+    cls.__call__ = w
+
+
+import ltx_pipelines.utils as U  # noqa: E402
+for cname, name in (("PromptEncoder", "text_encoder"), ("DiffusionStage", "dit"), ("VideoUpsampler", "upsampler"),
+                    ("VideoDecoder", "video_decoder"), ("AudioDecoder", "audio_decoder")):
+    cls = getattr(U, cname, None)
+    if cls is not None:
+        timed(cls, name)
+
+if rank != 0:
+    argv = sys.argv[1:]
+    if "--output-path" in argv:
+        argv[argv.index("--output-path") + 1] = f"/tmp/ltx_rank{rank}.mp4"
+    sys.argv = [sys.argv[0]] + argv
+t0 = time.perf_counter()
+sys.argv = ["distilled"] + sys.argv[1:]
+D.main()
+if rank == 0:
+    for k in T:
+        print(f"[STAGE] {k}: {T[k] * 1000:.0f} ms over {N[k]} calls", flush=True)
+    print(f"[STAGE] total: {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
