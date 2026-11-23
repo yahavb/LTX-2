@@ -48,9 +48,14 @@ if os.environ.get("LTX_ALL_NEURON", "0") == "1":
     # (same noise as the CPU reference; a few MB once per denoising stage)
     _Gen, _randn, _randn_like = torch.Generator, torch.randn, torch.randn_like
 
-    def _gen(device=None, *a, **k):
-        return _Gen("cpu")
-    torch.Generator = _gen
+    class _GM(type):
+        def __instancecheck__(cls, o):
+            return isinstance(o, _Gen)
+
+    class _G(metaclass=_GM):  # torch.Generator(device=...) -> a CPU generator; isinstance still works
+        def __new__(cls, device=None, *a, **k):
+            return _Gen("cpu")
+    torch.Generator = _G
 
     def _rn(*size, generator=None, device=None, **k):
         if generator is None:
