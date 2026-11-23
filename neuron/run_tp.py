@@ -12,6 +12,7 @@ import time
 
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 
 rank, world, local = (int(os.environ.get(k, d)) for k, d in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0)))
 DIT_DEV = os.environ.get("LTX_DIT_DEVICE", "neuron")
@@ -295,15 +296,55 @@ _orig_vd_call = VDm.VideoDecoder.__call__
 from ltx_core.model.video_vae import convolution as _CV  # noqa: E402
 
 
+# LTX_VAE_SPLIT=1: the conv decoder runs on a gh x gw grid of spatial tiles, one per rank (the trace: the decode was
+# 1123 ms replicated on all 16 ranks). The decoder's only cross-pixel ops are its 3x3x3 convs (pixel norm, no
+# attention, no noise, zeros padding), so each conv gets a 1-pixel halo from its neighbours (one all-gather per axis)
+# and the rank's tile is exact. The tiles are gathered into the full video at the end.
+_VSPLIT = {}
+
+
+def _halo(x, p, axis):
+    """Pad x [B,C,T,H,W] by p on spatial axis (3=H, 4=W) with the neighbouring tiles' edges; zeros at the borders."""
+    g = _VSPLIT
+    lo, hi = x.narrow(axis, 0, p), x.narrow(axis, x.shape[axis] - p, p)
+    allg = funcol.all_gather_tensor(torch.stack([lo, hi]).contiguous(), 0, g["group"])   # [2*world, ...]
+    i, j, gh, gw = g["i"], g["j"], g["gh"], g["gw"]
+    if axis == 3:
+        prev = allg[2 * ((i - 1) * gw + j) + 1] if i > 0 else torch.zeros_like(hi)
+        nxt = allg[2 * ((i + 1) * gw + j)] if i < gh - 1 else torch.zeros_like(lo)
+    else:
+        prev = allg[2 * (i * gw + j - 1) + 1] if j > 0 else torch.zeros_like(hi)
+        nxt = allg[2 * (i * gw + j + 1)] if j < gw - 1 else torch.zeros_like(lo)
+    return torch.cat([prev, x, nxt], dim=axis)
+
+
 def _cc3d_forward(self, x, causal=True):
     front = self.time_kernel_size - 1 if causal else (self.time_kernel_size - 1) // 2
     back = 0 if causal else front
-    if front == 0 and back == 0:
-        return self.conv(x)
-    parts = [x[:, :, :1].expand(-1, -1, front, -1, -1), x]
-    if back:
-        parts.append(x[:, :, -1:].expand(-1, -1, back, -1, -1))
-    return self.conv(torch.cat(parts, dim=2))
+    if front or back:
+        parts = [x[:, :, :1].expand(-1, -1, front, -1, -1), x]
+        if back:
+            parts.append(x[:, :, -1:].expand(-1, -1, back, -1, -1))
+        x = torch.cat(parts, dim=2)
+    c = self.conv
+    if _VSPLIT and (c.padding[1] or c.padding[2]):
+        assert c.stride[1:] == (1, 1) and c.padding_mode == "zeros", (c.stride, c.padding_mode)
+        x = _halo(_halo(x, c.padding[1], 3), c.padding[2], 4)
+        return torch.nn.functional.conv3d(x, c.weight, c.bias, c.stride, (0, 0, 0), c.dilation, c.groups)
+    return c(x)
+
+
+def _split_decode(dec, latent):
+    """The decoder forward on this rank's latent tile, then the tiles gathered into the full video (one graph)."""
+    g = _VSPLIT
+    gh, gw, i, j = g["gh"], g["gw"], g["i"], g["j"]
+    H, W = latent.shape[3], latent.shape[4]
+    tile = latent[:, :, :, i * H // gh:(i + 1) * H // gh, j * W // gw:(j + 1) * W // gw]
+    out = dec._orig_forward(tile)                                                           # [1,3,F,h,w]
+    allt = funcol.all_gather_tensor(out.contiguous(), 0, g["group"])                        # [world,3,F,h,w]
+    b, c, f, h, w = out.shape
+    allt = allt.view(gh, gw, c, f, h, w).permute(2, 3, 0, 4, 1, 5).reshape(1, c, f, gh * h, gw * w)
+    return allt
 
 
 if DIT_DEV == "neuron":
@@ -317,7 +358,15 @@ def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
         from ltx_core.model.video_vae.memory_efficient_decode import disable_memory_efficient_decode
         dec = self._prepared_builder().build(device=dit_device, dtype=torch.bfloat16).eval()
         dec = disable_memory_efficient_decode(dec)
-        dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False, fullgraph=_FG)
+        if os.environ.get("LTX_VAE_SPLIT", "0") == "1" and world > 1:
+            gh = int(os.environ.get("LTX_VAE_GRID_H", "4")); gw = world // gh
+            assert gh * gw == world
+            _VSPLIT.update(group=dist.group.WORLD, gh=gh, gw=gw, i=rank // gw, j=rank % gw)
+            dec._orig_forward = dec.forward
+            _sf = torch.compile(functools.partial(_split_decode, dec), backend="neuron", dynamic=False, fullgraph=_FG)
+            dec.forward = lambda sample, timestep=None, generator=None, _sf=_sf: _sf(sample)
+        else:
+            dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False, fullgraph=_FG)
         _vdec["dec"] = dec
     dec = _vdec["dec"]
     with torch.no_grad():
