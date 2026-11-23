@@ -136,14 +136,19 @@ def _cache_prompt(cls):
 _cached = {}
 _orig_build = DS.DiffusionStage._build_transformer
 
-# LTX_COMPILE=model: the perturbation checks read a host tensor (bool(...)), one graph break per block. The masks are
-# fixed for a run (the distilled pipeline has no guidance passes), so the checks are compile-time constants.
-from ltx_core.guidance import perturbations as _PT  # noqa: E402
-for _c in vars(_PT).values():
-    if isinstance(_c, type):
-        for _n in ("any_in_batch", "all_in_batch"):
-            if _n in vars(_c):
-                setattr(_c, _n, torch._dynamo.assume_constant_result(vars(_c)[_n]))
+# LTX_COMPILE=model: the perturbation checks read a host tensor (bool(...)): one graph break per block. Before each
+# compiled call the host mask is checked eagerly: when nothing is perturbed (the distilled pipeline: no guidance
+# passes), the checks return the constant False inside the graph; otherwise the call fails instead of running wrong.
+from ltx_core.guidance.perturbations import BatchedPerturbationConfig as _BPC  # noqa: E402
+_any0, _all0 = _BPC.any_in_batch, _BPC.all_in_batch
+_BPC.any_in_batch = lambda self, t, b: False if getattr(self, "_none_perturbed", False) else _any0(self, t, b)
+_BPC.all_in_batch = lambda self, t, b: False if getattr(self, "_none_perturbed", False) else _all0(self, t, b)
+
+
+def _mark_unperturbed(perturbations):
+    if perturbations is not None:
+        assert bool((perturbations._block_masks.host_tensor != 0).all()), "perturbed batch under LTX_COMPILE=model"
+        perturbations._none_perturbed = True
 
 
 def _te_patch(cls):
@@ -185,7 +190,12 @@ def _build_transformer(self, *, device=None, **kw):
         m = m.to(dit_device)
         if os.environ.get("LTX_COMPILE", "blocks") == "model":
             # LTX_COMPILE=model: the whole DiT forward (embeddings, AdaLN, RoPE, every block, the head) as one graph
-            m.forward = torch.compile(m.forward, backend="neuron", dynamic=False)
+            _cf = torch.compile(m.forward, backend="neuron", dynamic=False)
+
+            def _fw(video, audio, perturbations, _cf=_cf):
+                _mark_unperturbed(perturbations)
+                return _cf(video, audio, perturbations)
+            m.forward = _fw
         else:
             for mod in m.modules():
                 blocks = getattr(mod, "transformer_blocks", None)
