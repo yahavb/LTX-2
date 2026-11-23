@@ -136,6 +136,15 @@ def _cache_prompt(cls):
 _cached = {}
 _orig_build = DS.DiffusionStage._build_transformer
 
+# LTX_COMPILE=model: the perturbation checks read a host tensor (bool(...)), one graph break per block. The masks are
+# fixed for a run (the distilled pipeline has no guidance passes), so the checks are compile-time constants.
+from ltx_core.guidance import perturbations as _PT  # noqa: E402
+for _c in vars(_PT).values():
+    if isinstance(_c, type):
+        for _n in ("any_in_batch", "all_in_batch"):
+            if _n in vars(_c):
+                setattr(_c, _n, torch._dynamo.assume_constant_result(vars(_c)[_n]))
+
 
 def _te_patch(cls):
     """LTX_TE_NEURON=1: the Gemma text encoder built on CPU once, tensor-parallel over the ranks, on this rank's core,
