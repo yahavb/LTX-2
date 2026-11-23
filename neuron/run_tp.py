@@ -94,12 +94,17 @@ def _build_transformer(self, *, device=None, **kw):
     m = _orig_build(self, device=torch.device("cpu"), **kw)
     if DIT_DEV == "neuron":
         tp.shard_transformer(m, rank, world, dist.group.WORLD if world > 1 else None)
-        m = _wrap_io(m.to(dit_device))
-        for mod in m.modules():
-            blocks = getattr(mod, "transformer_blocks", None)
-            if blocks is not None:
-                for b in blocks:
-                    b.forward = torch.compile(b.forward, backend="neuron", dynamic=False)
+        m = m.to(dit_device)
+        if os.environ.get("LTX_COMPILE", "blocks") == "model":
+            # LTX_COMPILE=model: the whole DiT forward (embeddings, AdaLN, RoPE, every block, the head) as one graph
+            m.forward = torch.compile(m.forward, backend="neuron", dynamic=False)
+        else:
+            for mod in m.modules():
+                blocks = getattr(mod, "transformer_blocks", None)
+                if blocks is not None:
+                    for b in blocks:
+                        b.forward = torch.compile(b.forward, backend="neuron", dynamic=False)
+        m = _wrap_io(m)
     if rank == 0:
         print(f"[tp] DiT built, sharded and placed in {time.time() - t0:.1f} s on {dit_device}", flush=True)
     _cached[key] = m
