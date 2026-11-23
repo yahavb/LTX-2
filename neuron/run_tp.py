@@ -139,6 +139,37 @@ _cached = {}
 _FG = os.environ.get("LTX_FULLGRAPH", "1") == "1"
 _orig_build = DS.DiffusionStage._build_transformer
 
+# LTX_STEP_GRAPH=1: one compiled graph per denoising step = denoiser (modality from the latent state, the DiT) +
+# post-process + Euler update, with (sigma, sigma_next) as a device tensor so every step of a stage reuses it.
+# The trace: ~20 ms of idle (enc_barrier + execute_schedule) before each of the 11 DiT steps, switching between the
+# small eager step graphs and the DiT graph.
+from ltx_pipelines.utils import samplers as _SM  # noqa: E402
+
+
+def _step_graph_loop(sigmas, video_state, audio_state, transformer, denoiser, v_context=None, a_context=None):
+    stepper = _SM.EulerDiffusionStep()
+    dev = _SM._present_state(video_state, audio_state).latent.device
+    sched = sigmas.to(dev)
+    pairs = [sched[i:i + 2].clone() for i in range(len(sched) - 1)]
+
+    def body(vs, as_, s2, vc, ac):
+        vr, ar = denoiser(transformer, vs, as_, s2, 0, vc, ac)
+        dv = vr.denoised if vr is not None else None
+        da = ar.denoised if ar is not None else None
+        return _SM._step_state(vs, dv, stepper, s2, 0), _SM._step_state(as_, da, stepper, s2, 0)
+    key = ("step", id(transformer))
+    if key not in _cached:
+        _cached[key] = torch.compile(body, backend="neuron", dynamic=False, fullgraph=_FG)
+    cb = _cached[key]
+    for s2 in pairs:
+        video_state, audio_state = cb(video_state, audio_state, s2, v_context, a_context)
+    return _SM.VideoAudio(video_state, audio_state)
+
+
+if os.environ.get("LTX_STEP_GRAPH", "0") == "1":
+    _SM.euler_denoising_loop = _step_graph_loop
+    DS.euler_denoising_loop = _step_graph_loop
+
 # LTX_COMPILE=model: the perturbation checks read a host tensor (bool(...)): one graph break per block. Before each
 # compiled call the host mask is checked eagerly: when nothing is perturbed (the distilled pipeline: no guidance
 # passes), the checks return the constant False inside the graph; otherwise the call fails instead of running wrong.
