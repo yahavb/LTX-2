@@ -46,7 +46,7 @@ _orig_build = DS.DiffusionStage._build_transformer
 
 def _build_transformer(self, *, device=None, **kw):
     """Build on CPU once, shard over the TP group, move to this rank's core, compile every block; reuse after."""
-    key = id(self)
+    key = "dit"   # one DiT per process: reused across pipeline instances (LTX_RUNS > 1)
     if key in _cached:
         return _cached[key]
     t0 = time.time()
@@ -135,10 +135,13 @@ if rank != 0:
     if "--output-path" in argv:
         argv[argv.index("--output-path") + 1] = f"/tmp/ltx_rank{rank}.mp4"
     sys.argv = [sys.argv[0]] + argv
-t0 = time.perf_counter()
 sys.argv = ["distilled"] + sys.argv[1:]
-D.main()
-if rank == 0:
-    for k in T:
-        print(f"[STAGE] {k}: {T[k] * 1000:.0f} ms over {N[k]} calls", flush=True)
-    print(f"[STAGE] total: {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
+for run in range(int(os.environ.get("LTX_RUNS", "1"))):
+    # LTX_RUNS=N: N generations in one process; the DiT is built and compiled once, so runs after the first are warm
+    T.clear(); N.clear()
+    t0 = time.perf_counter()
+    D.main()
+    if rank == 0:
+        for k in T:
+            print(f"[STAGE] run {run} {k}: {T[k] * 1000:.0f} ms over {N[k]} calls", flush=True)
+        print(f"[STAGE] run {run} total: {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
