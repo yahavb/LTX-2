@@ -217,3 +217,82 @@ def shard_gemma(model: torch.nn.Module, rank: int, world: int, group=None) -> to
     if rank == 0:
         print(f"[tp] gemma: sharded {n} attentions over {world} ranks", flush=True)
     return model
+
+
+# ---------------- sequence parallel for the video stream (LTX_SP=1) ----------------
+# The DiT stage-2 pair: under plain TP every rank holds the full [T, 4096] video residual, so the RMS norms, AdaLN
+# modulation and residual adds run 16x redundantly (Vector 63% busy) and every row-parallel output is all-reduced
+# (384 x 6 MB per step, 64 ms). With SP each rank keeps T/world video tokens between the attention / FF modules:
+# the module input is all-gathered (tokens), its row-parallel output reduce-scattered (tokens). Same math.
+_SP = {"on": False}
+
+
+def _loc(t):
+    """This rank's token slice of a per-token video tensor [.., T, D] (no-op for broadcast / audio tensors)."""
+    if _SP["on"] and isinstance(t, torch.Tensor) and t.ndim >= 2 and t.shape[-2] == _SP["T"]:
+        return t.narrow(-2, _SP["lo"], _SP["Tl"])
+    return t
+
+
+def _ag(t):
+    return funcol.all_gather_tensor(t.contiguous(), 1, _SP["group"]) if _SP["on"] else t
+
+
+def _sp_rowout_forward(self, x):
+    y = torch.nn.functional.linear(x, self.weight)
+    if _SP["on"] and getattr(self, "sp_rs", False):
+        y = funcol.reduce_scatter_tensor(y.contiguous(), "sum", 1, self.group)
+    else:
+        y = all_reduce(y, self.group)
+    return y + self.bias if self.bias is not None else y
+
+
+def enable_sequence_parallel(model: torch.nn.Module, rank: int, world: int, group) -> None:
+    """Video-stream sequence parallel on a TP-sharded LTX AV transformer (see the comment above)."""
+    from dataclasses import replace
+    from ltx_core.model.transformer.transformer import BasicAVTransformerBlock as _B
+    RowOut.forward = _sp_rowout_forward
+    for b in model.modules():
+        if not isinstance(b, _B):
+            continue
+        for name in ("attn1", "attn2", "ff", "audio_to_video_attn"):
+            m = getattr(b, name, None)
+            if m is None:
+                continue
+            for r in m.modules():
+                if isinstance(r, RowOut):
+                    r.sp_rs = True
+            f = m.forward
+
+            def fx(x, *a, _f=f, **k):
+                return _f(_ag(x), *a, **k)
+            m.forward = fx
+        v2a = getattr(b, "video_to_audio_attn", None)
+        if v2a is not None:
+            f = v2a.forward
+
+            def fc(x, *a, _f=f, context=None, **k):
+                return _f(x, *a, context=_ag(context), **k)
+            v2a.forward = fc
+    for meth in ("get_ada_values", "get_av_ca_ada_values"):
+        g = getattr(_B, meth)
+        setattr(_B, meth, (lambda _g: lambda self, *a, **k: tuple(_loc(t) for t in _g(self, *a, **k)))(g))
+    for vm in model.modules():
+        if hasattr(vm, "_process_transformer_blocks") and hasattr(vm, "transformer_blocks"):
+            pb = vm._process_transformer_blocks
+
+            def pbw(video, audio, perturbations, _pb=pb):
+                if video is None:
+                    return _pb(video, audio, perturbations)
+                T = video.x.shape[1]
+                assert T % world == 0, f"{T} video tokens over {world} ranks"
+                _SP.update(on=True, T=T, Tl=T // world, lo=rank * (T // world), group=group)
+                cm = video.cross_attn_perturbation_mask if hasattr(video, "cross_attn_perturbation_mask") else None
+                video = replace(video, x=_loc(video.x))
+                v, a = _pb(video, audio, perturbations)
+                v = replace(v, x=_ag(v.x))
+                _SP["on"] = False
+                return v, a
+            vm._process_transformer_blocks = pbw
+    if rank == 0:
+        print(f"[tp] video sequence parallel over {world} ranks", flush=True)

@@ -191,6 +191,8 @@ def _build_transformer(self, *, device=None, **kw):
     m = _orig_build(self, device=torch.device("cpu"), **kw)
     if DIT_DEV == "neuron":
         tp.shard_transformer(m, rank, world, dist.group.WORLD if world > 1 else None)
+        if os.environ.get("LTX_SP", "0") == "1" and world > 1:
+            tp.enable_sequence_parallel(m, rank, world, dist.group.WORLD)
         m = m.to(dit_device)
         if os.environ.get("LTX_COMPILE", "model") == "model":
             # LTX_COMPILE=model: the whole DiT forward (embeddings, AdaLN, RoPE, every block, the head) as one graph
