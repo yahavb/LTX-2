@@ -146,6 +146,20 @@ _orig_build = DS.DiffusionStage._build_transformer
 from ltx_pipelines.utils import samplers as _SM  # noqa: E402
 
 
+def _euler_state(state, denoised, s2):
+    """_step_state + EulerDiffusionStep with sigma kept a device tensor. The stock to_velocity calls sigma.item()
+    (a host round trip, data-dependent under compile: the step graph produced an all-NaN latent). Same formulas."""
+    if state is None or denoised is None:
+        return state
+    from ltx_pipelines.utils.helpers import post_process_latent
+    from dataclasses import replace as _rp
+    d = post_process_latent(denoised, state.denoise_mask.tensor, state.clean_latent)
+    x = state.latent
+    sig, nxt = s2[0].float(), s2[1].float()
+    v = ((x.float() - d.float()) / sig).to(x.dtype)
+    return _rp(state, latent=(x.float() + v.float() * (nxt - sig)).to(x.dtype))
+
+
 def _step_graph_loop(sigmas, video_state, audio_state, transformer, denoiser, v_context=None, a_context=None):
     stepper = _SM.EulerDiffusionStep()
     dev = _SM._present_state(video_state, audio_state).latent.device
@@ -156,7 +170,7 @@ def _step_graph_loop(sigmas, video_state, audio_state, transformer, denoiser, v_
         vr, ar = denoiser(transformer, vs, as_, s2, 0, vc, ac)
         dv = vr.denoised if vr is not None else None
         da = ar.denoised if ar is not None else None
-        return _SM._step_state(vs, dv, stepper, s2, 0), _SM._step_state(as_, da, stepper, s2, 0)
+        return _euler_state(vs, dv, s2), _euler_state(as_, da, s2)
     key = ("step", id(transformer))
     if key not in _cached:
         _cached[key] = torch.compile(body, backend="neuron", dynamic=False, fullgraph=_FG)
