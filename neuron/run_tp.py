@@ -199,6 +199,48 @@ def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
 
 
 VDm.VideoDecoder.__call__ = _vd_call
+# --- the latent upsampler and the audio decoder + vocoder on this rank's Neuron core, compiled once ---
+from ltx_pipelines.utils.blocks import video_upsampler as VUm, audio_decoder as ADm  # noqa: E402
+from ltx_core.model.upsampler.model import upsample_video  # noqa: E402
+from ltx_core.model.audio_vae.audio_vae import decode_audio  # noqa: E402
+_orig_up_call, _orig_ad_call = VUm.VideoUpsampler.__call__, ADm.AudioDecoder.__call__
+_res = {}
+
+
+def _on_neuron():
+    return DIT_DEV == "neuron" and os.environ.get("LTX_STAGES_NEURON", "1") == "1"
+
+
+def _up_call(self, latent):
+    if not _on_neuron():
+        return _orig_up_call(self, latent)
+    if "up" not in _res:
+        enc = self._encoder_builder.build(device=dit_device, dtype=self._dtype).eval()
+        up = self._upsampler_builder.build(device=dit_device, dtype=self._dtype).eval()
+        up.forward = torch.compile(up.forward, backend="neuron", dynamic=False)
+        _res["up"] = (enc, up)
+    enc, up = _res["up"]
+    with torch.no_grad():
+        return upsample_video(latent=latent.to(dit_device, self._dtype), video_encoder=enc, upsampler=up).cpu()
+
+
+def _ad_call(self, latent):
+    if not _on_neuron():
+        return _orig_ad_call(self, latent)
+    if "ad" not in _res:
+        dec = self._decoder_builder.build(device=dit_device, dtype=self._dtype).eval()
+        voc = self._vocoder_builder.build(device=dit_device, dtype=torch.float32).eval()
+        dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False)
+        voc.forward = torch.compile(voc.forward, backend="neuron", dynamic=False)
+        _res["ad"] = (dec, voc)
+    dec, voc = _res["ad"]
+    with torch.no_grad():
+        a = decode_audio(latent.to(dit_device, self._dtype), dec, voc)
+    return type(a)(waveform=a.waveform.cpu(), sampling_rate=a.sampling_rate)
+
+
+VUm.VideoUpsampler.__call__ = _up_call
+ADm.AudioDecoder.__call__ = _ad_call
 _enc = D.encode_media_segments
 
 
