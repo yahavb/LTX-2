@@ -107,7 +107,8 @@ def _cache_prompt(cls):
         key = (tuple(prompts), repr(sorted(k.items())))
         if key not in _prompts:
             dev0 = self._device
-            self._device = torch.device("cpu")
+            if os.environ.get("LTX_TE_NEURON", "0") != "1":
+                self._device = torch.device("cpu")
             try:
                 _prompts[key] = f(self, prompts, *a, **k)
             finally:
@@ -119,6 +120,33 @@ def _cache_prompt(cls):
 
 _cached = {}
 _orig_build = DS.DiffusionStage._build_transformer
+
+
+def _te_patch(cls):
+    """LTX_TE_NEURON=1: the Gemma text encoder built on CPU once, tensor-parallel over the ranks, on this rank's core,
+    every decoder layer compiled."""
+    f = cls._build_text_encoder
+
+    def b(self):
+        if "te" in _cached:
+            return _cached["te"]
+        t0 = time.time()
+        dev0 = self._device
+        self._device = torch.device("cpu")
+        try:
+            m = f(self)
+        finally:
+            self._device = dev0
+        tp.shard_gemma(m, rank, world, dist.group.WORLD if world > 1 else None)
+        m = m.to(dit_device)
+        for mod in m.modules():
+            if type(mod).__name__ == "Gemma4TextDecoderLayer":
+                mod.forward = torch.compile(mod.forward, backend="neuron", dynamic=False)
+        if rank == 0:
+            print(f"[te] gemma on {dit_device} in {time.time() - t0:.1f}s", flush=True)
+        _cached["te"] = m
+        return m
+    cls._build_text_encoder = b
 
 
 def _build_transformer(self, *, device=None, **kw):
@@ -207,6 +235,8 @@ def timed(cls, name):
 
 import ltx_pipelines.utils as U  # noqa: E402
 _cache_prompt(U.PromptEncoder)
+if os.environ.get("LTX_TE_NEURON", "0") == "1":
+    _te_patch(U.PromptEncoder)
 for cname, name in (("PromptEncoder", "text_encoder"), ("DiffusionStage", "dit"), ("VideoUpsampler", "upsampler"),
                     ("VideoDecoder", "video_decoder"), ("AudioDecoder", "audio_decoder")):
     cls = getattr(U, cname, None)

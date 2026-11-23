@@ -121,3 +121,50 @@ def shard_transformer(model: torch.nn.Module, rank: int, world: int, group=None)
     if rank == 0:
         print(f"[tp] sharded {n_att} attentions and {n_ff} feed-forwards over {world} ranks", flush=True)
     return model
+
+
+def shard_gemma(model: torch.nn.Module, rank: int, world: int, group=None) -> torch.nn.Module:
+    """Tensor-parallel Gemma 4 text decoder: one query head per rank (16 heads over 16 ranks).
+
+    q_proj keeps this rank's heads and o_proj their input columns (row parallel, all-reduced); a sliding layer's
+    k/v keep the key-value head its query head uses (8 kv heads: rank // 2), a global layer's single shared k=v head
+    stays whole; the MLP's gate/up keep this rank's columns and down_proj its rows (all-reduced). Per-head norms and
+    RoPE are per head and need no change. Same math; only the reduction order changes.
+    """
+    if world == 1:
+        return model
+    n = 0
+    for name, a in list(model.named_modules()):
+        if type(a).__name__ == "Gemma4TextAttention":
+            nq = a.q_proj.out_features // a.head_dim
+            assert nq % world == 0, f"{nq} heads over {world} ranks"
+            hl = nq // world
+            lo, hi = rank * hl * a.head_dim, (rank + 1) * hl * a.head_dim
+            a.q_proj = _col(a.q_proj, lo, hi)
+            if getattr(a, "k_proj", None) is not None:
+                nkv = a.k_proj.out_features // a.head_dim
+                if nkv > 1:
+                    q_per_kv = nq // nkv
+                    kv0 = (rank * hl) // q_per_kv
+                    kv1 = ((rank + 1) * hl - 1) // q_per_kv + 1
+                    klo, khi = kv0 * a.head_dim, kv1 * a.head_dim
+                    a.k_proj = _col(a.k_proj, klo, khi)
+                    if a.v_proj is not None:
+                        a.v_proj = _col(a.v_proj, klo, khi)
+                    nkv_l = kv1 - kv0
+                else:
+                    nkv_l = 1
+                a.num_key_value_groups = hl // nkv_l
+            else:
+                a.num_key_value_groups = hl   # kv-shared layer: uses the (sharded) states of an earlier layer
+            a.o_proj = RowOut(a.o_proj, lo, hi, group)
+            n += 1
+        elif type(a).__name__ == "Gemma4TextMLP":
+            m = a.gate_proj.out_features
+            assert m % world == 0
+            lo, hi = rank * m // world, (rank + 1) * m // world
+            a.gate_proj, a.up_proj = _col(a.gate_proj, lo, hi), _col(a.up_proj, lo, hi)
+            a.down_proj = RowOut(a.down_proj, lo, hi, group)
+    if rank == 0:
+        print(f"[tp] gemma: sharded {n} attentions over {world} ranks", flush=True)
+    return model
