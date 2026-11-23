@@ -277,6 +277,25 @@ from ltx_pipelines.utils.blocks import video_decoder as VDm  # noqa: E402
 _vdec = {}
 _orig_vd_call = VDm.VideoDecoder.__call__
 
+# the causal conv pads time into an empty(memory_format=...) buffer with three slice writes; aten.empty.memory_format
+# does not lower on Neuron. One cat of the same frames: byte-identical values.
+from ltx_core.model.video_vae import convolution as _CV  # noqa: E402
+
+
+def _cc3d_forward(self, x, causal=True):
+    front = self.time_kernel_size - 1 if causal else (self.time_kernel_size - 1) // 2
+    back = 0 if causal else front
+    if front == 0 and back == 0:
+        return self.conv(x)
+    parts = [x[:, :, :1].expand(-1, -1, front, -1, -1), x]
+    if back:
+        parts.append(x[:, :, -1:].expand(-1, -1, back, -1, -1))
+    return self.conv(torch.cat(parts, dim=2))
+
+
+if DIT_DEV == "neuron":
+    _CV.CausalConv3d.forward = _cc3d_forward
+
 
 def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
     if DIT_DEV != "neuron" or os.environ.get("LTX_VAE_NEURON", "1") != "1":
