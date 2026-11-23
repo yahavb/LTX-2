@@ -353,6 +353,9 @@ sys.argv = ["distilled"] + sys.argv[1:]
 for run in range(int(os.environ.get("LTX_RUNS", "1"))):
     # LTX_RUNS=N: N generations in one process; the DiT is built and compiled once, so runs after the first are warm
     T.clear(); N.clear()
+    if run > 0:
+        # an idle gap between runs: the system trace's last run is everything after the last gap (attribution)
+        time.sleep(float(os.environ.get("LTX_RUN_GAP_S", "0")))
     t0 = time.perf_counter()
     D.main()
     if rank == 0:
