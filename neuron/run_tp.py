@@ -40,6 +40,47 @@ for _m in list(sys.modules.values()):
     if hasattr(_m, "get_device"):
         setattr(_m, "get_device", lambda: torch.device("cpu"))
 
+# --- serving shape: every model built once and kept resident; the prompt encoding cached by prompt ---
+import contextlib
+from ltx_core.loader.simple_builder import SimpleBuilder  # noqa: E402
+
+_built = {}
+_orig_sb_build = SimpleBuilder.build
+
+
+def _sb_build(self, device=None, dtype=None, **kw):
+    key = (id(self), str(device), str(dtype), tuple(sorted(kw.items())) if kw else ())
+    if key not in _built:
+        _built[key] = _orig_sb_build(self, device=device, dtype=dtype, **kw)
+    return _built[key]
+
+
+SimpleBuilder.build = _sb_build
+
+
+@contextlib.contextmanager
+def _keep(model, alloc_trim_strategy=None):
+    yield model
+
+
+for _m in list(sys.modules.values()):
+    if _m is not None and getattr(_m, "__name__", "").startswith("ltx_pipelines") and hasattr(_m, "gpu_model"):
+        setattr(_m, "gpu_model", _keep)
+
+_prompts = {}
+
+
+def _cache_prompt(cls):
+    f = cls.__call__
+
+    @functools.wraps(f)
+    def w(self, prompts, *a, **k):
+        key = (tuple(prompts), repr(sorted(k.items())))
+        if key not in _prompts:
+            _prompts[key] = f(self, prompts, *a, **k)
+        return _prompts[key]
+    cls.__call__ = w
+
 _cached = {}
 _orig_build = DS.DiffusionStage._build_transformer
 
@@ -124,6 +165,7 @@ def timed(cls, name):
 
 
 import ltx_pipelines.utils as U  # noqa: E402
+_cache_prompt(U.PromptEncoder)
 for cname, name in (("PromptEncoder", "text_encoder"), ("DiffusionStage", "dit"), ("VideoUpsampler", "upsampler"),
                     ("VideoDecoder", "video_decoder"), ("AudioDecoder", "audio_decoder")):
     cls = getattr(U, cname, None)
@@ -135,6 +177,18 @@ if rank != 0:
     if "--output-path" in argv:
         argv[argv.index("--output-path") + 1] = f"/tmp/ltx_rank{rank}.mp4"
     sys.argv = [sys.argv[0]] + argv
+_enc = D.encode_media_segments
+
+
+def _timed_encode(*a, **k):
+    t0 = time.perf_counter()
+    r = _enc(*a, **k)
+    T["decode+encode (video, audio, mp4)"] += time.perf_counter() - t0
+    N["decode+encode (video, audio, mp4)"] += 1
+    return r
+
+
+D.encode_media_segments = _timed_encode
 sys.argv = ["distilled"] + sys.argv[1:]
 for run in range(int(os.environ.get("LTX_RUNS", "1"))):
     # LTX_RUNS=N: N generations in one process; the DiT is built and compiled once, so runs after the first are warm
