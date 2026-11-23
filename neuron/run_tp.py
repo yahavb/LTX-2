@@ -352,6 +352,53 @@ def _split_decode(dec, latent):
 if DIT_DEV == "neuron":
     _CV.CausalConv3d.forward = _cc3d_forward
 
+# --- vocoder (the trace: 587 ms, GpSimd 95% busy) -- LTX_VOC_FAST=1 ---
+# UpSample1d's conv_transpose1d reverses its filter every call (134 ms of reverse DMA on Scalar) and runs on a
+# zero-stuffed input; replicate padding lowers to an indirect gather. Polyphase form instead: y[s*q+p] =
+# sum_j f[p+s*j] x[q-j], i.e. s depthwise conv1d with the reversed sub-filters, interleaved; replicate padding
+# as one cat of edge copies. Same products and sums per output sample.
+from ltx_core.model.audio_vae import vocoder as _VOC  # noqa: E402
+
+
+def _rep_pad(x, left, right):
+    parts = []
+    if left:
+        parts.append(x[..., :1].expand(*x.shape[:-1], left))
+    parts.append(x)
+    if right:
+        parts.append(x[..., -1:].expand(*x.shape[:-1], right))
+    return torch.cat(parts, dim=-1) if len(parts) > 1 else x
+
+
+def _up_forward(self, x):
+    b, c, _ = x.shape
+    s, k = self.stride, self.kernel_size
+    assert k % s == 0
+    j = k // s
+    x = _rep_pad(x, self.pad, self.pad)
+    f = self.filter.to(dtype=x.dtype, device=x.device).reshape(-1)
+    w = torch.stack([f[p::s].flip(0) for p in range(s)])                         # [s, J]
+    w = w.unsqueeze(0).expand(c, s, j).reshape(c * s, 1, j)
+    h = torch.nn.functional.conv1d(torch.nn.functional.pad(x, (j - 1, j - 1)), w, groups=c)   # [B, C*s, L']
+    y = h.view(b, c, s, -1).transpose(2, 3).reshape(b, c, -1)
+    y = self.ratio * y
+    return y[..., self.pad_left: -self.pad_right]
+
+
+def _lp_forward(self, x):
+    _, c, _ = x.shape
+    if self.padding:
+        if self.padding_mode == "replicate":
+            x = _rep_pad(x, self.pad_left, self.pad_right)
+        else:
+            x = torch.nn.functional.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
+    return torch.nn.functional.conv1d(x, self.filter.expand(c, -1, -1), stride=self.stride, groups=c)
+
+
+if DIT_DEV == "neuron" and os.environ.get("LTX_VOC_FAST", "0") == "1":
+    _VOC.UpSample1d.forward = _up_forward
+    _VOC.LowPassFilter1d.forward = _lp_forward
+
 
 def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
     if DIT_DEV != "neuron" or os.environ.get("LTX_VAE_NEURON", "1") != "1":
