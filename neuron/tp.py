@@ -8,11 +8,15 @@ shard_transformer(model, rank, world, group) rewrites the model in place after i
 Everything else (AdaLN tables, embeddings, the caption projection, the connector) stays replicated. The math is the
 same as the unsharded model; only the order of the reductions changes (bf16 rounding).
 """
+import functools
+import os
+
 import torch
 import torch.distributed as dist
 
 from ltx_core.model.transformer.attention import Attention
 from ltx_core.model.transformer.feed_forward import FeedForward
+from ltx_core.model.transformer.rope import apply_rotary_emb
 
 
 import torch.distributed._functional_collectives as funcol
@@ -93,6 +97,51 @@ def _shard_attention(a: Attention, rank: int, world: int, group) -> None:
         return fwd(x, context=context, mask=mask, pe=_sl(pe), k_pe=_sl(k_pe), perturbation_mask=perturbation_mask,
                    all_perturbed=all_perturbed)
     a.forward = forward
+    if os.environ.get("LTX_TP_FUSED_NORM", "0") == "1":
+        a.forward = functools.partial(_fused_norm_forward, a, _sl)
+
+
+def _fused_norm_forward(a, _sl, x, context=None, mask=None, pe=None, k_pe=None, perturbation_mask=None,
+                        all_perturbed=False):
+    """Attention.forward with the q and k RMS norms reduced in ONE all-reduce (LTX_TP_FUSED_NORM=1).
+
+    The trace (DiT stage-1 pair) shows 576 tiny fp32 all-reduces per step, latency-bound (~10 us each): the q-norm
+    and k-norm sums of squares are reduced separately. Here both are concatenated along the token axis and reduced
+    once. Same sums, same formula; only the collective's buffer changes.
+    """
+    pe, k_pe = _sl(pe), _sl(k_pe)
+    context = x if context is None else context
+    v = a.to_v(context)
+    if all_perturbed:
+        out = v
+    else:
+        q, k = a.to_q(x), a.to_k(context)
+        qn, kn = a.q_norm, a.k_norm
+        qf, kf = q.float(), k.float()
+        ss = torch.cat([(qf * qf).sum(-1, keepdim=True), (kf * kf).sum(-1, keepdim=True)], dim=1)
+        ss = all_reduce(ss, qn.group)
+        t = q.shape[1]
+        q = (qf * torch.rsqrt(ss[:, :t] / qn.full_dim + qn.eps))
+        k = (kf * torch.rsqrt(ss[:, t:] / kn.full_dim + kn.eps))
+        if qn.weight is not None:
+            q = q * qn.weight.float()
+        if kn.weight is not None:
+            k = k * kn.weight.float()
+        q, k = q.to(x.dtype), k.to(x.dtype)
+        if pe is not None:
+            q = apply_rotary_emb(q, pe, a.rope_type)
+            k = apply_rotary_emb(k, pe if k_pe is None else k_pe, a.rope_type)
+        if mask is None:
+            out = a.attention_function(q, k, v, a.heads)
+        else:
+            out = a.masked_attention_function(q, k, v, a.heads, mask)
+    if a.to_gate_logits is not None and not all_perturbed:
+        gates = 2.0 * torch.sigmoid(a.to_gate_logits(x))
+        b, t, _ = out.shape
+        out = (out.view(b, t, a.heads, a.dim_head) * gates.unsqueeze(-1)).view(b, t, a.heads * a.dim_head)
+    if not all_perturbed and perturbation_mask is not None:
+        out = out * perturbation_mask + v * (1 - perturbation_mask)
+    return a.to_out(out)
 
 
 def _shard_ff(f: FeedForward, rank: int, world: int, group) -> None:
