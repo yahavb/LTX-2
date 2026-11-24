@@ -228,10 +228,19 @@ def _install_voc_split(rt, g):
     ADm = rt["ADm"]
     call = ADm.AudioDecoder.__call__
 
+    flagged = {}
+
     def ad_call(self, latent):
-        voc = self._vocoder_builder.build(device=rt["dit_device"], dtype=torch.float32)   # memoized: the one compiled
-        for m in voc.modules():
-            if isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
-                m._vs = True
+        # flag the vocoder's convs once (the first call, before _ad_call compiles it); later calls go straight through
+        if id(self) not in flagged:
+            import time as _t
+            t0 = _t.perf_counter()
+            voc = self._vocoder_builder.build(device=rt["dit_device"], dtype=torch.float32)   # memoized
+            for m in voc.modules():
+                if isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
+                    m._vs = True
+            flagged[id(self)] = True
+            if rank == 0:
+                print(f"[VOC] flagged the split vocoder in {(_t.perf_counter() - t0) * 1e3:.0f} ms", flush=True)
         return call(self, latent)
     ADm.AudioDecoder.__call__ = ad_call
