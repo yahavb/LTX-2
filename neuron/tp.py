@@ -235,13 +235,28 @@ def _loc(t):
 
 
 def _ag(t):
-    return funcol.all_gather_tensor(t.contiguous(), 1, _SP["group"]) if _SP["on"] else t
+    """All-gather the token dim. With batch 1 the collective runs on dim 0 of a [T, D] view: funcol on dim 1 does a
+    cat(chunk(...)) reshuffle (the stage-2 pair: copies / transposes at torch/_utils.py:1195). Same values."""
+    if not _SP["on"]:
+        return t
+    if t.shape[0] == 1:
+        y = funcol.all_gather_tensor(t.reshape(t.shape[1], -1).contiguous(), 0, _SP["group"])
+        return y.reshape(1, -1, *t.shape[2:])
+    return funcol.all_gather_tensor(t.contiguous(), 1, _SP["group"])
+
+
+def _rs(y, group):
+    """Reduce-scatter the token dim (dim 0 of a [T, D] view when batch is 1, as in _ag)."""
+    if y.shape[0] == 1:
+        z = funcol.reduce_scatter_tensor(y.reshape(y.shape[1], -1).contiguous(), "sum", 0, group)
+        return z.reshape(1, -1, *y.shape[2:])
+    return funcol.reduce_scatter_tensor(y.contiguous(), "sum", 1, group)
 
 
 def _sp_rowout_forward(self, x):
     y = torch.nn.functional.linear(x, self.weight)
     if _SP["on"] and getattr(self, "sp_rs", False):
-        y = funcol.reduce_scatter_tensor(y.contiguous(), "sum", 1, self.group)
+        y = _rs(y, self.group)
     else:
         y = all_reduce(y, self.group)
     return y + self.bias if self.bias is not None else y
