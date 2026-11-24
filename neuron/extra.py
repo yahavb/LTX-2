@@ -16,6 +16,24 @@ import torch
 
 def install(rt):
     """rt: the run_tp module namespace (globals())."""
+    g = int(os.environ.get("LTX_BUILD_GROUP", "0"))
+    if g > 0 and rt["world"] > 1:
+        # LTX_BUILD_GROUP=G: the ranks build the DiT on CPU G at a time. All 16 at once peak at ~16 x 44 GB of host
+        # memory (the l-lnc2 pod with a 900 GiB limit was OOM-killed); G=4 peaks at ~4 x 44 GB.
+        DS, dist, cached, rank, world = rt["DS"], rt["dist"], rt["_cached"], rt["rank"], rt["world"]
+        bt = DS.DiffusionStage._build_transformer
+
+        def staged(self, *a, **k):
+            if "dit" in cached:
+                return bt(self, *a, **k)
+            m = None
+            for i in range(0, world, g):
+                if i <= rank < i + g:
+                    m = bt(self, *a, **k)
+                    gc.collect()
+                dist.barrier()
+            return m
+        DS.DiffusionStage._build_transformer = staged
     if os.environ.get("LTX_TE_FREE", "0") == "1":
         U = rt["U"]
         built = rt["_built"]
