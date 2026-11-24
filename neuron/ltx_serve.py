@@ -123,6 +123,15 @@ def _http_server(role, jobs, decodes):
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), log_level="warning")
 
 
+def _poll(q, timeout=float(os.environ.get("LTX_IDLE_BEAT_S", "30"))):
+    """rank 0: the next queued item, or None after `timeout` s (an idle heartbeat broadcast to the other ranks, which
+    otherwise sit in the broadcast past the collective timeout and abort)."""
+    try:
+        return q.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
 def _bcast(obj, rank):
     box = [obj if rank == 0 else None]
     dist.broadcast_object_list(box, src=0)
@@ -165,8 +174,10 @@ def main(rt):
         print("[SERVE] ready", flush=True)
 
     while True:
-        job = jobs.pending.get() if rank == 0 else None
+        job = _poll(jobs.pending) if rank == 0 else None
         spec = _bcast(None if job is None else (job.prompt, job.seed, job.live), rank)
+        if spec is None:               # idle heartbeat: keeps the other ranks' broadcast under the collective timeout
+            continue
         prompt, seed, live = spec
         k = 0
         while True:
@@ -283,8 +294,10 @@ def _vae_loop(rt, base, fps, decodes, out):
         READY.set()
         print("[SERVE] vae ready", flush=True)
     while True:
-        item = decodes.get() if rank == 0 else None
+        item = _poll(decodes) if rank == 0 else None
         body = _bcast(None if item is None else item[0], rank)
+        if body is None:               # idle heartbeat
+            continue
         try:
             mp4 = decode(body)
             if rank == 0:
