@@ -16,7 +16,7 @@
   button:disabled { opacity: .45; }
   textarea { width: 100%; min-height: 4.2em; resize: vertical; }
   #view { position: relative; width: 100%; aspect-ratio: 768 / 512; background: #000; border-radius: 8px; overflow: hidden; }
-  video { width: 100%; height: 100%; object-fit: contain; display: block; }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; position: absolute; top: 0; left: 0; }
   .glass { background: rgba(10, 14, 20, .28); backdrop-filter: blur(10px) saturate(140%);
     -webkit-backdrop-filter: blur(10px) saturate(140%); border: 1px solid rgba(255, 255, 255, .22);
     border-radius: 8px; color: #e8f4ff; font: 600 13px/1.3 ui-monospace, monospace; letter-spacing: .04em; }
@@ -38,19 +38,38 @@
     <textarea id="prompt" aria-label="Prompt">gentle ripples spreading across the calm lake water, tree leaves swaying softly in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera push-in, serene natural motion</textarea>
   </div>
   <div id="view">
-    <video id="v" playsinline aria-label="Generated video with audio"></video>
+    <video id="v0" class="vid" playsinline aria-label="Generated video with audio"></video>
+    <video id="v1" class="vid" playsinline aria-hidden="true" style="display:none"></video>
     <div id="hud" class="glass" aria-hidden="true"></div>
   </div>
   <div id="status" role="status" aria-live="polite">Checking the backend...</div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const be = $("be"), v = $("v"), st = $("status"), hud = $("hud"), startB = $("start"), stopB = $("stopBtn");
-let queue = [], ctrl = null, chunks = 0, t0 = 0, genSum = 0;
+const be = $("be"), st = $("status"), hud = $("hud"), startB = $("start"), stopB = $("stopBtn");
+const vids = [$("v0"), $("v1")];
+// Gapless playback: two video elements, the next chunk preloaded in the hidden one and swapped in on "ended".
+// Each chunk is played at the generation rate (playbackRate = chunk length / generation time, at most 1), so the
+// stream keeps up with the generator instead of stalling between chunks; one chunk stays buffered as slack.
+let queue = [], ctrl = null, chunks = 0, cur = 0, playing = false, rate = 1, started = false;
+const CHUNK_S = 49 / 24, PREBUF = 2;
 const say = t => { st.textContent = t; };
-function playNext() { if (v.src && !v.ended && !v.paused) return; const u = queue.shift(); if (!u) return;
-  if (v.src) URL.revokeObjectURL(v.src); v.src = u; v.play().catch(() => {}); }
-v.addEventListener("ended", playNext);
+function load(el, url) { el.src = url; el.preservesPitch = true; el.load(); }
+function swapIn() {
+  const nxt = vids[1 - cur], url = queue.shift(); if (!url) { playing = false; return; }
+  if (!nxt.src || nxt.dataset.url !== url) { nxt.dataset.url = url; load(nxt, url); }
+  nxt.playbackRate = rate; nxt.style.display = "block"; nxt.removeAttribute("aria-hidden");
+  nxt.play().catch(() => {});
+  const old = vids[cur]; old.pause(); old.style.display = "none"; old.setAttribute("aria-hidden", "true");
+  if (old.dataset.url) URL.revokeObjectURL(old.dataset.url); old.removeAttribute("src"); old.dataset.url = "";
+  cur = 1 - cur; playing = true;
+  if (queue[0]) { const pre = vids[1 - cur]; pre.dataset.url = queue[0]; load(pre, queue[0]); }
+}
+vids.forEach(el => el.addEventListener("ended", swapIn));
+function offer(url) { queue.push(url);
+  if (!started && queue.length >= PREBUF) { started = true; swapIn(); }
+  else if (started && !playing) swapIn();
+  else if (playing && queue.length === 1) { const pre = vids[1 - cur]; pre.dataset.url = url; load(pre, url); } }
 async function status() {
   if (ctrl) return;
   try { const r = await (await fetch("api/status?backend=" + be.value)).json();
@@ -61,7 +80,7 @@ async function status() {
 }
 status(); setInterval(status, 10000); be.onchange = status;
 startB.onclick = async () => {
-  if (ctrl) ctrl.abort(); ctrl = new AbortController(); queue = []; chunks = 0; genSum = 0; t0 = performance.now();
+  if (ctrl) ctrl.abort(); ctrl = new AbortController(); queue = []; chunks = 0; started = false; playing = false; rate = 1;
   startB.disabled = true; stopB.disabled = false; say("Generating the first chunk...");
   let r;
   try { r = await fetch("api/session", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl.signal,
@@ -73,10 +92,11 @@ startB.onclick = async () => {
     let i; while ((i = buf.indexOf("\n\n")) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 2);
       if (!line.startsWith("data: ")) continue; const ev = JSON.parse(line.slice(6));
       if (ev.mp4) { const b = Uint8Array.from(atob(ev.mp4), c => c.charCodeAt(0));
-        queue.push(URL.createObjectURL(new Blob([b], { type: "video/mp4" }))); chunks++; genSum += ev.gen_s; playNext();
+        chunks++; if (chunks > 1) rate = Math.min(1, CHUNK_S / ev.gen_s);   // chunk 1 includes the prompt encode
+        offer(URL.createObjectURL(new Blob([b], { type: "video/mp4" })));
         const fps = (49 / ev.gen_s).toFixed(1);
         hud.textContent = `chunk ${chunks}  gen ${ev.gen_s}s  ${fps} fps` + (ev.vae_s ? `  vae ${ev.vae_s}s` : "");
-        say(`Playing. Chunk ${chunks} generated in ${ev.gen_s} seconds.`); }
+        say(chunks < PREBUF ? "Buffering..." : `Playing at the generation rate, ${(24 * rate).toFixed(0)} fps. Chunk ${chunks} took ${ev.gen_s} s.`); }
       else if (ev.error) say("Error: " + ev.error);
       else if (ev.superseded) say("Another session took over.");
       else if (ev.done) say(`Done: ${ev.chunks} chunks.`); } } } catch (e) {}
