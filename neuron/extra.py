@@ -159,19 +159,36 @@ def _install_voc_split(rt, g):
     torch.nn.Conv1d.forward, torch.nn.ConvTranspose1d.forward = conv1d, convt
     up_fwd, lp_fwd, stft_fwd, bwe_fwd = V.UpSample1d.forward, V.LowPassFilter1d.forward, V._STFTFn.forward, \
         V.VocoderWithBWE.forward
-    rep_pad = rt["_rep_pad"]
 
-    def with_halo(fwd):
-        def f(self, x):
-            if not _AS["on"]:
-                return fwd(self, x)
-            rt["_rep_pad"] = lambda t, l, r: _side(t, l, r, "replicate", "updown")   # the stock pad, from the neighbours
-            try:
-                return fwd(self, x)
-            finally:
-                rt["_rep_pad"] = rep_pad
-        return f
-    V.UpSample1d.forward, V.LowPassFilter1d.forward = with_halo(up_fwd), with_halo(lp_fwd)
+    # the anti-alias up/down filters with the halo exchange called directly. (Swapping run_tp's _rep_pad global at
+    # call time worked eagerly on CPU, but the compiled graph kept the stock pad: split != stock on device.)
+    def up(self, x):
+        if not _AS["on"]:
+            return up_fwd(self, x)
+        b_, c, _ = x.shape
+        s_, k = self.stride, self.kernel_size
+        jj = -(-k // s_)
+        x = _side(x, self.pad, self.pad, "replicate", "updown")
+        lp = x.shape[-1]
+        f = self.filter.to(dtype=x.dtype, device=x.device).reshape(-1)
+        if jj * s_ > k:
+            f = torch.cat([f, f.new_zeros(jj * s_ - k)])
+        w = torch.stack([f[p::s_].flip(0) for p in range(s_)]).unsqueeze(0).expand(c, s_, jj).reshape(c * s_, 1, jj)
+        h = F.conv1d(F.pad(x, (jj - 1, jj - 1)), w, groups=c)
+        y = h.view(b_, c, s_, -1).transpose(2, 3).reshape(b_, c, -1)
+        n = (lp - 1) * s_ + k
+        return self.ratio * y[..., self.pad_left: n - self.pad_right]
+
+    def lp(self, x):
+        if not _AS["on"]:
+            return lp_fwd(self, x)
+        _, c, _ = x.shape
+        if self.padding:
+            assert self.padding_mode == "replicate", self.padding_mode
+            x = _side(x, self.pad_left, self.pad_right, "replicate", "updown")
+        return F.conv1d(x, self.filter.expand(c, -1, -1), stride=self.stride, groups=c)
+
+    V.UpSample1d.forward, V.LowPassFilter1d.forward = up, lp
 
     def stft(self, y):
         if not _AS["on"]:
