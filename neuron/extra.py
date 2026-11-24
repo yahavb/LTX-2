@@ -232,14 +232,14 @@ def _install_voc_split(rt, g):
 
     def ad_call(self, latent):
         # flag the vocoder's convs once (the first call, before _ad_call compiles it); later calls go straight through
-        if id(self) not in flagged:
+        if not flagged:   # once per process: _ad_call compiles one vocoder (new pipelines per run would rebuild it)
             import time as _t
             t0 = _t.perf_counter()
             voc = self._vocoder_builder.build(device=rt["dit_device"], dtype=torch.float32)   # memoized
             for m in voc.modules():
                 if isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
                     m._vs = True
-            flagged[id(self)] = True
+            flagged["done"] = True
             if rank == 0:
                 print(f"[VOC] flagged the split vocoder in {(_t.perf_counter() - t0) * 1e3:.0f} ms", flush=True)
         return call(self, latent)
