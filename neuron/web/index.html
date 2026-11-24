@@ -9,26 +9,26 @@
 </style></head>
 <body>
 <h2>LTX-2.5 text to video + audio, on Trainium</h2>
-<div>Backend: __BACKEND__</div>
+<label>Backend <select id="be" aria-label="Backend">__BACKENDS__</select></label>
 <textarea id="prompt" aria-label="Prompt">gentle ripples spreading across the calm lake water, tree leaves swaying softly in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera push-in, serene natural motion</textarea><br>
 <button id="go">Start</button><button id="stop">Stop</button>
 <label><input type="checkbox" id="live" checked> continuous</label>
 <video id="v" playsinline controls aria-label="Generated video"></video>
 <div id="st" role="status" aria-live="polite">checking backend...</div>
 <script>
-const v = document.getElementById("v"), st = document.getElementById("st");
+const be = document.getElementById("be"), v = document.getElementById("v"), st = document.getElementById("st");
 let queue = [], ctrl = null, chunks = 0, t0 = 0;
 function playNext(){ if (!v.paused && !v.ended && v.src) return; const u = queue.shift(); if (!u) return;
   v.src = u; v.play().catch(()=>{}); }
 v.addEventListener("ended", playNext);
-async function status(){ try { const r = await (await fetch("api/status")).json();
+async function status(){ try { const r = await (await fetch("api/status?backend=" + be.value)).json();
   if (!ctrl) st.textContent = r.ready ? "ready" : "backend warming up: " + r.detail; } catch(e){ st.textContent = "no backend"; } }
-status(); setInterval(status, 10000);
+status(); setInterval(status, 10000); be.onchange = status;
 document.getElementById("go").onclick = async () => {
   if (ctrl) ctrl.abort(); ctrl = new AbortController(); queue = []; chunks = 0; t0 = performance.now();
   st.textContent = "generating...";
   const r = await fetch("api/session", {method: "POST", headers: {"Content-Type": "application/json"}, signal: ctrl.signal,
-    body: JSON.stringify({prompt: document.getElementById("prompt").value, live: document.getElementById("live").checked})});
+    body: JSON.stringify({backend: be.value, prompt: document.getElementById("prompt").value, live: document.getElementById("live").checked})});
   if (!r.ok) { st.textContent = "error: " + await r.text(); ctrl = null; return; }
   const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
   try { for (;;) { const {value, done} = await rd.read(); if (done) break; buf += dec.decode(value, {stream: true});
@@ -41,6 +41,6 @@ document.getElementById("go").onclick = async () => {
       else if (ev.superseded) st.textContent = "superseded by a newer session";
       else if (ev.done) st.textContent = `done: ${ev.chunks} chunks`; } } } catch(e) {}
   ctrl = null; };
-document.getElementById("stop").onclick = async () => { if (ctrl) ctrl.abort(); ctrl = null; await fetch("api/stop", {method: "POST"});
+document.getElementById("stop").onclick = async () => { if (ctrl) ctrl.abort(); ctrl = null; await fetch("api/stop?backend=" + be.value, {method: "POST"});
   st.textContent = "stopped"; };
 </script></body></html>

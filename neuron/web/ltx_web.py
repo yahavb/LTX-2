@@ -9,22 +9,31 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
-LTX_URL = os.environ.get("LTX_URL", "http://ltx.default.svc.cluster.local:8000")
+# LTX_URLS: "label=url,label=url" -- the page offers each backend (co-located ltx, disaggregated ltx-dit)
+LTX_URLS = dict(kv.split("=", 1) for kv in os.environ.get(
+    "LTX_URLS", "colo=http://ltx.default.svc.cluster.local:8000").split(","))
 PREFIX = os.environ.get("URL_PREFIX", "").rstrip("/")
 INDEX = (Path(__file__).parent / "index.html").read_text()
-client = httpx.AsyncClient(base_url=LTX_URL, timeout=httpx.Timeout(10, read=None))
+clients = {k: httpx.AsyncClient(base_url=u, timeout=httpx.Timeout(10, read=None)) for k, u in LTX_URLS.items()}
+
+
+def _client(name):
+    if name not in clients:
+        raise HTTPException(400, f"unknown backend {name!r}")
+    return clients[name]
 app = FastAPI()
 
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return INDEX.replace("__BACKEND__", os.environ.get("BACKEND_LABEL", LTX_URL))
+    opts = "".join(f'<option value="{k}">{k}</option>' for k in LTX_URLS)
+    return INDEX.replace("__BACKENDS__", opts)
 
 
 @app.get("/api/status")
-async def status():
+async def status(backend: str = "colo"):
     try:
-        r = await client.get("/readiness")
+        r = await _client(backend).get("/readiness")
         return {"ready": r.status_code == 200, "detail": r.json() if r.status_code == 200 else r.text[:200]}
     except Exception as e:  # noqa: BLE001
         return {"ready": False, "detail": str(e)[:200]}
@@ -35,6 +44,7 @@ async def session(request: Request):
     body = await request.json()
     if not (body.get("prompt") or "").strip():
         raise HTTPException(400, "prompt required")
+    client = _client(body.get("backend", "colo"))
     req = client.build_request("POST", "/session", json={"prompt": body["prompt"], "seed": int(body.get("seed", 42)),
                                                           "live": bool(body.get("live", True))})
     r = await client.send(req, stream=True)
@@ -54,8 +64,8 @@ async def session(request: Request):
 
 
 @app.post("/api/stop")
-async def stop():
-    r = await client.post("/stop")
+async def stop(backend: str = "colo"):
+    r = await _client(backend).post("/stop")
     return r.json()
 
 
