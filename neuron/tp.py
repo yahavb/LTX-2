@@ -239,7 +239,7 @@ def _ag(t):
     cat(chunk(...)) reshuffle (the stage-2 pair: copies / transposes at torch/_utils.py:1195). Same values."""
     if not _SP["on"]:
         return t
-    if t.shape[0] == 1:
+    if t.shape[0] == 1 and os.environ.get("LTX_SP_DIM0", "0") == "1":
         y = funcol.all_gather_tensor(t.reshape(t.shape[1], -1).contiguous(), 0, _SP["group"])
         return y.reshape(1, -1, *t.shape[2:])
     return funcol.all_gather_tensor(t.contiguous(), 1, _SP["group"])
@@ -247,7 +247,7 @@ def _ag(t):
 
 def _rs(y, group):
     """Reduce-scatter the token dim (dim 0 of a [T, D] view when batch is 1, as in _ag)."""
-    if y.shape[0] == 1:
+    if y.shape[0] == 1 and os.environ.get("LTX_SP_DIM0", "0") == "1":
         z = funcol.reduce_scatter_tensor(y.reshape(y.shape[1], -1).contiguous(), "sum", 0, group)
         return z.reshape(1, -1, *y.shape[2:])
     return funcol.reduce_scatter_tensor(y.contiguous(), "sum", 1, group)
