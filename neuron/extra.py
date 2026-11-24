@@ -89,7 +89,7 @@ _AS = {"on": False, "t": 1, "v": 1}
 def _side(x, left, right, mode, kind=""):
     """[prev rank's last `left` samples, x, next rank's first `right` samples] (stock padding at the borders)."""
     g, i, grp = _AS["g"], _AS["i"], _AS["group"]
-    if kind and kind in os.environ.get("LTX_VOC_NOHALO", ""):   # compile bisect only: local padding, not exact
+    if kind and kind in os.environ.get("LTX_VOC_NOHALO", "").split(","):   # compile bisect only: local padding, not exact
         pad = [x[..., :1].expand(*x.shape[:-1], left)] if (left and mode == "replicate") else \
             ([x.new_zeros(*x.shape[:-1], left)] if left else [])
         post = [x[..., -1:].expand(*x.shape[:-1], right)] if (right and mode == "replicate") else \
@@ -102,22 +102,23 @@ def _side(x, left, right, mode, kind=""):
         keep = torch.arange(L, device=x.device) < valid
         fill = x[..., valid - 1:valid] if mode == "replicate" else torch.zeros_like(x[..., :1])
         x = torch.where(keep, x, fill)
+    # one all-gather per op for both edges (rule 1: fewer, bigger collectives; two per op put the vocoder graph at
+    # ~1200 collectives and it failed at execution, ~800 ran)
+    b = x.shape[0]
+    a = funcol.all_gather_tensor(torch.cat([x[..., :right], x[..., L - left:]], dim=-1).contiguous(), 0, grp) \
+        if (left or right) else None                                               # [g*B, C, right + left]
     parts = []
     if left:
-        a = funcol.all_gather_tensor(x[..., -left:].contiguous(), 0, grp)          # [g*B, C, left]
-        b = x.shape[0]
         if i > 0:
-            parts.append(a[(i - 1) * b:i * b])
+            parts.append(a[(i - 1) * b:i * b, ..., right:])
         elif mode == "replicate":
             parts.append(x[..., :1].expand(*x.shape[:-1], left))
         else:
             parts.append(x.new_zeros(*x.shape[:-1], left))
     parts.append(x)
     if right:
-        a = funcol.all_gather_tensor(x[..., :right].contiguous(), 0, grp)
-        b = x.shape[0]
         if i < g - 1:
-            parts.append(a[(i + 1) * b:(i + 2) * b])
+            parts.append(a[(i + 1) * b:(i + 2) * b, ..., :right])
         elif mode == "replicate":
             parts.append(x[..., -1:].expand(*x.shape[:-1], right))
         else:
