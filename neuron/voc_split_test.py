@@ -24,16 +24,14 @@ with torch.no_grad():
 mel = torch.randn(1, 2, 104, 64, dtype=torch.float64)
 with torch.no_grad():
     ref = m(mel)
-rt = {"dist": dist, "rank": rank, "world": world, "_rep_pad": ns["_rep_pad"], "dit_device": torch.device("cpu"),
-      "ADm": types.SimpleNamespace(AudioDecoder=type("A", (), {"__call__": lambda s, l: None}))}
+rt = ns   # the up/down forwards read _rep_pad from this namespace, as run_tp's do from run_tp's globals
+rt.update({"dist": dist, "rank": rank, "world": world, "dit_device": torch.device("cpu"),
+           "ADm": types.SimpleNamespace(AudioDecoder=type("A", (), {"__call__": lambda s, l: None}))})
 import extra
 extra._install_voc_split(rt, world)
-ns["_rep_pad"] = rt["_rep_pad"]
 for mod in m.modules():
     if isinstance(mod, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
         mod._vs = True
-# the split forwards read run_tp's _rep_pad through rt; point the test's copies at rt too
-ns_up, ns_lp = ns["_up_forward"], ns["_lp_forward"]
 with torch.no_grad():
     out = m(mel)
 if rank == 0:
