@@ -21,7 +21,7 @@ with torch.no_grad():
     for p in m.parameters():
         p.normal_(0, 0.05)
     m.mel_stft.mel_basis.uniform_(0, 0.1); m.mel_stft.stft_fn.forward_basis.normal_(0, 0.05)
-mel = torch.randn(1, 2, 104, 64)
+mel = torch.randn(1, 2, int(os.environ.get("T", "101")), 64)
 with torch.no_grad():
     ref = m(mel)
 rt = ns   # the up/down forwards read _rep_pad from this namespace, as run_tp's do from run_tp's globals

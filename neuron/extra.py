@@ -83,12 +83,19 @@ def report(rank):
 import torch.nn.functional as F  # noqa: E402
 import torch.distributed._functional_collectives as funcol  # noqa: E402
 
-_AS = {"on": False}
+_AS = {"on": False, "t": 1, "v": 1}
 
 
 def _side(x, left, right, mode):
     """[prev rank's last `left` samples, x, next rank's first `right` samples] (stock padding at the borders)."""
     g, i, grp = _AS["g"], _AS["i"], _AS["group"]
+    L = x.shape[-1]
+    valid = L * _AS["v"] // _AS["t"]
+    if valid < L:
+        # the last slice is partial: past the true end the stock op sees its border padding (zeros / the last sample)
+        keep = torch.arange(L, device=x.device) < valid
+        fill = x[..., valid - 1:valid] if mode == "replicate" else torch.zeros_like(x[..., :1])
+        x = torch.where(keep, x, fill)
     parts = []
     if left:
         a = funcol.all_gather_tensor(x[..., -left:].contiguous(), 0, grp)          # [g*B, C, left]
@@ -169,16 +176,19 @@ def _install_voc_split(rt, g):
 
     def bwe(self, mel_spec):
         T = mel_spec.shape[2]
-        assert T % g == 0, f"{T} mel frames over {g} ranks"
-        t = T // g
-        _AS["on"] = True
+        t = -(-T // g)                                   # frames per slice; the last slice may be partial
+        v = max(0, min(t, T - _AS["i"] * t))             # this rank's real frames
+        assert v > 0, f"{T} mel frames leave rank slot {_AS['i']} empty over {g} ranks"
+        if t * g > T:
+            mel_spec = F.pad(mel_spec, (0, 0, 0, t * g - T))   # values unused: masked before every cross-time op
+        _AS.update(on=True, t=t, v=v)
         try:
             y = bwe_fwd(self, mel_spec[:, :, _AS["i"] * t:(_AS["i"] + 1) * t])         # [B, C, L]
         finally:
             _AS["on"] = False
         b, c, L = y.shape
         a = funcol.all_gather_tensor(y.contiguous(), 0, _AS["group"])                # [g*B, C, L]
-        return a.view(g, b, c, L).permute(1, 2, 0, 3).reshape(b, c, g * L)
+        return a.view(g, b, c, L).permute(1, 2, 0, 3).reshape(b, c, g * L)[..., :T * (L // t)]
     V.VocoderWithBWE.forward = bwe
 
     ADm = rt["ADm"]
