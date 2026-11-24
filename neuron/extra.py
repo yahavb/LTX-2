@@ -140,24 +140,20 @@ def _install_voc_split(rt, g):
         return F.conv1d(_side(x, p, p, "zeros", "conv"), self.weight, self.bias, 1, 0, self.dilation, self.groups)
 
     def convt(self, x):
-        # polyphase form: ConvTranspose1d(stride s) = s ordinary conv1d (one per output phase, reversed sub-kernels)
-        # on the halo-padded input, interleaved. The halo-padded conv_transpose1d hit NCC_IIIT901 and the overlap-add
-        # form failed at execution; halo-padded conv1d works. Same sums.
+        # gathered form: the stock conv_transpose1d on the full (gathered) input on every rank, then this rank's
+        # slice of the output. The halo-padded conv_transpose1d hit NCC_IIIT901; the overlap-add and polyphase forms
+        # failed at execution ("Invalid NEFF"). The upsample layers are a small part of the vocoder's work.
         if not (_AS["on"] and getattr(self, "_vs", False)):
             return convt_fwd(self, x)
-        s, k, pp = self.stride[0], self.kernel_size[0], self.padding[0]
-        assert self.output_padding[0] == 0 and self.dilation[0] == 1 and self.groups == 1
-        j = -(-k // s)
-        w = self.weight                                                            # [Cin, Cout, k]
-        if j * s > k:
-            w = torch.cat([w, w.new_zeros(*w.shape[:2], j * s - k)], dim=-1)
         L = x.shape[-1]
-        xe = _side(x, j, j, "zeros")                                                # [B, Cin, L + 2j]
-        cs = [F.conv1d(xe, w[:, :, q::s].flip(-1).transpose(0, 1).contiguous()) for q in range(s)]  # [B,Cout,L+j+1]
-        z = torch.stack(cs, dim=-1).reshape(x.shape[0], w.shape[1], -1)            # phase-interleaved
-        st = pp + s
-        y = z[..., st:st + L * s]
-        return y + self.bias[None, :, None] if self.bias is not None else y
+        valid = L * _AS["v"] // _AS["t"]
+        if valid < L:
+            x = torch.where(torch.arange(L, device=x.device) < valid, x, torch.zeros_like(x[..., :1]))
+        b, c, _ = x.shape
+        full = funcol.all_gather_tensor(x.reshape(b * c, L).contiguous(), 1, _AS["group"]).reshape(b, c, -1)
+        y = convt_fwd(self, full)                                                    # [B, Cout, g*L*s]
+        n = L * self.stride[0]
+        return y[..., _AS["i"] * n:(_AS["i"] + 1) * n]
 
     torch.nn.Conv1d.forward, torch.nn.ConvTranspose1d.forward = conv1d, convt
     up_fwd, lp_fwd, stft_fwd, bwe_fwd = V.UpSample1d.forward, V.LowPassFilter1d.forward, V._STFTFn.forward, \
