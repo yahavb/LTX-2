@@ -530,9 +530,79 @@ def _lp_forward(self, x):
     return torch.nn.functional.conv1d(x, self.filter.expand(c, -1, -1), stride=self.stride, groups=c)
 
 
+# LTX_VOC_MM=1: the vocoder's depthwise filters (one filter shared by all channels) as banded matmuls on the Tensor
+# engine (the trace after VOC_FAST: Vector 70% busy on run_tp.py:517/530, Tensor 36%). The time axis is cut into
+# blocks of P outputs; each block's W <= 128 input samples (the block plus the filter's overlap) are gathered once
+# into a contiguous [.., nb, W] tile and multiplied by a constant [W, P/s * R] Toeplitz matrix. Same products,
+# summed in a different order (fp32).
+def _fir_mats(ws, stride):
+    """ws [R, K] (R interleaved output phases) -> (M [W, (P/stride)*R], P)."""
+    r_, k = ws.shape
+    p = ((128 - k + stride) // stride) * stride
+    w = p - stride + k
+    n = p // stride
+    m = torch.zeros(w, n * r_, dtype=ws.dtype)
+    for t in range(n):
+        for r in range(r_):
+            m[t * stride:t * stride + k, t * r_ + r] = ws[r]
+    return m, p
+
+
+def _fir_mm(x, mat, p, k, stride, r_):
+    """Valid-mode y[t*R + r] = sum_j ws[r, j] x[t*stride + j] for every channel, via one matmul."""
+    b, c, t_in = x.shape
+    t_out = (t_in - k) // stride + 1
+    nb = -(-(t_out * stride) // p)
+    x = torch.nn.functional.pad(x, (0, (nb + 1) * p - t_in))
+    main = x[..., :nb * p].reshape(b, c, nb, p)
+    tail = x[..., p:(nb + 1) * p].reshape(b, c, nb, p)[..., :k - stride]
+    y = torch.matmul(torch.cat([main, tail], dim=-1), mat.to(x.dtype))
+    return y.reshape(b, c, -1)[..., :t_out * r_]
+
+
+def _prep_voc_mm(model):
+    for m in model.modules():
+        if isinstance(m, _VOC.UpSample1d):
+            s_, k = m.stride, m.kernel_size
+            j = -(-k // s_)
+            f = m.filter.detach().double().reshape(-1).cpu()
+            if j * s_ > k:
+                f = torch.cat([f, f.new_zeros(j * s_ - k)])
+            ws = torch.stack([f[q::s_].flip(0) for q in range(s_)])
+            mat, p = _fir_mats(ws, 1)
+            m._mm = (mat.float().to(m.filter.device), p, j, 1, s_)
+        elif isinstance(m, _VOC.LowPassFilter1d):
+            ws = m.filter.detach().double().reshape(1, -1).cpu()
+            mat, p = _fir_mats(ws, m.stride)
+            m._mm = (mat.float().to(m.filter.device), p, m.kernel_size, m.stride, 1)
+
+
+def _up_forward_mm(self, x):
+    b, c, _ = x.shape
+    mat, p, j, st, s_ = self._mm
+    x = _rep_pad(x, self.pad, self.pad)
+    lp = x.shape[-1]
+    y = _fir_mm(torch.nn.functional.pad(x, (j - 1, j - 1)), mat, p, j, st, s_)
+    n = (lp - 1) * s_ + self.kernel_size
+    return self.ratio * y[..., self.pad_left: n - self.pad_right]
+
+
+def _lp_forward_mm(self, x):
+    mat, p, k, st, r_ = self._mm
+    if self.padding:
+        if self.padding_mode == "replicate":
+            x = _rep_pad(x, self.pad_left, self.pad_right)
+        else:
+            x = torch.nn.functional.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
+    return _fir_mm(x, mat, p, k, st, r_)
+
+
 if DIT_DEV == "neuron" and os.environ.get("LTX_VOC_FAST", "0") == "1":
     _VOC.UpSample1d.forward = _up_forward
     _VOC.LowPassFilter1d.forward = _lp_forward
+    if os.environ.get("LTX_VOC_MM", "0") == "1":
+        _VOC.UpSample1d.forward = _up_forward_mm
+        _VOC.LowPassFilter1d.forward = _lp_forward_mm
 
 
 def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
@@ -595,6 +665,8 @@ def _ad_call(self, latent):
         dec = self._decoder_builder.build(device=dit_device, dtype=self._dtype).eval()
         voc = self._vocoder_builder.build(device=dit_device, dtype=torch.float32).eval()
         dec.forward = torch.compile(dec.forward, backend="neuron", dynamic=False, fullgraph=_FG)
+        if os.environ.get("LTX_VOC_MM", "0") == "1":
+            _prep_voc_mm(voc)
         voc.forward = torch.compile(voc.forward, backend="neuron", dynamic=False, fullgraph=_FG)
         _res["ad"] = (dec, voc)
     dec, voc = _res["ad"]
