@@ -692,6 +692,10 @@ D.encode_media_segments = _timed_encode
 sys.argv = ["distilled"] + sys.argv[1:]
 import extra  # noqa: E402  (new patches: see extra.py, keeps the graph source lines above unchanged)
 extra.install(globals())
+if os.environ.get("LTX_SERVE", "0") == "1":   # the demo server (ltx_serve.py): colo / dit / vae roles
+    import ltx_serve  # noqa: E402
+    ltx_serve.main(globals())
+    sys.exit(0)
 for run in range(int(os.environ.get("LTX_RUNS", "1"))):
     # LTX_RUNS=N: N generations in one process; the DiT is built and compiled once, so runs after the first are warm
     T.clear(); N.clear()

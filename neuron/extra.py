@@ -36,6 +36,17 @@ def install(rt):
         DS.DiffusionStage._build_transformer = staged
     if int(os.environ.get("LTX_VOC_SPLIT", "0")) > 1 and rt["world"] > 1:
         _install_voc_split(rt, int(os.environ["LTX_VOC_SPLIT"]))
+    if os.environ.get("LTX_TE_RANK0", "0") == "1" and rt["world"] > 1:
+        # the text encoder on rank 0 only; its (cached) output broadcast to the other ranks: one Gemma copy per pod
+        # instead of 16, so prompts can change per session without each rank holding the 12B encoder
+        U, dist, move, rank, dev = rt["U"], rt["dist"], rt["_move"], rt["rank"], rt["dit_device"]
+        pe = U.PromptEncoder.__call__
+
+        def te(self, *a, **k):
+            box = [move(pe(self, *a, **k), torch.device("cpu")) if rank == 0 else None]
+            dist.broadcast_object_list(box, src=0)
+            return move(box[0], dev)
+        U.PromptEncoder.__call__ = te
     if os.environ.get("LTX_TE_FREE", "0") == "1":
         U = rt["U"]
         built = rt["_built"]
