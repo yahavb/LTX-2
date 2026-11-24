@@ -140,15 +140,29 @@ def _install_voc_split(rt, g):
         return F.conv1d(_side(x, p, p, "zeros", "conv"), self.weight, self.bias, 1, 0, self.dilation, self.groups)
 
     def convt(self, x):
+        # overlap-add form: each rank's conv_transpose1d on its own slice, the spill past the slice edges exchanged
+        # with the neighbours and added (a conv_transpose1d on a halo-padded input hit NCC_IIIT901). Same sums.
         if not (_AS["on"] and getattr(self, "_vs", False)):
             return convt_fwd(self, x)
         s, k, pp = self.stride[0], self.kernel_size[0], self.padding[0]
-        assert self.output_padding[0] == 0 and self.dilation[0] == 1
-        h = -(-k // s) + 1
+        assert self.output_padding[0] == 0 and self.dilation[0] == 1 and k - s - pp >= 0
         L = x.shape[-1]
-        z = F.conv_transpose1d(_side(x, h, h, "zeros", "convt"), self.weight, self.bias, s, 0, 0, self.groups)
-        st = h * s + pp
-        return z[..., st:st + L * s]
+        valid = L * _AS["v"] // _AS["t"]
+        if valid < L:
+            x = torch.where(torch.arange(L, device=x.device) < valid, x, torch.zeros_like(x[..., :1]))
+        z = F.conv_transpose1d(x, self.weight, None, s, 0, 0, self.groups)       # [B, C, L*s + k - s]
+        g, i, grp, b = _AS["g"], _AS["i"], _AS["group"], x.shape[0]
+        n, tn = L * s, k - s - pp
+        y = z[..., pp:pp + n]
+        if tn:
+            tails = funcol.all_gather_tensor(z[..., n + pp:].contiguous(), 0, grp)    # [g*B, C, tn]
+            if i > 0:
+                y = y + torch.cat([tails[(i - 1) * b:i * b], y.new_zeros(*y.shape[:-1], n - tn)], dim=-1)
+        if pp:
+            heads = funcol.all_gather_tensor(z[..., :pp].contiguous(), 0, grp)        # [g*B, C, pp]
+            if i < g - 1:
+                y = y + torch.cat([y.new_zeros(*y.shape[:-1], n - pp), heads[(i + 1) * b:(i + 2) * b]], dim=-1)
+        return y + self.bias[None, :, None] if self.bias is not None else y
 
     torch.nn.Conv1d.forward, torch.nn.ConvTranspose1d.forward = conv1d, convt
     up_fwd, lp_fwd, stft_fwd, bwe_fwd = V.UpSample1d.forward, V.LowPassFilter1d.forward, V._STFTFn.forward, \
