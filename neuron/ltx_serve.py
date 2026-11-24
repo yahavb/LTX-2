@@ -299,6 +299,13 @@ def _dit_hooks(rt, fps):  # noqa: C901
         for c in chunks:
             if rank == 0:
                 buf = io.BytesIO()
+                # only what the decode reads: the latents and the layout (the conditioning factories are local
+                # functions, not picklable, and the prompt embeddings are not used by the decoders)
+                from dataclasses import replace
+                from ltx_pipelines.chunks import state as _CS
+                c = replace(c, video_context=None, audio_context=None,
+                            make_video_conditionings=_CS._empty_conditionings,
+                            make_audio_conditionings=_CS._empty_conditionings)
                 torch.save({"chunk": move(c, torch.device("cpu")), "fps": fps}, buf)
                 pending["body"] = buf.getvalue()
         return iter(())
