@@ -690,6 +690,8 @@ def _timed_encode(*a, **k):
 
 D.encode_media_segments = _timed_encode
 sys.argv = ["distilled"] + sys.argv[1:]
+import extra  # noqa: E402  (new patches: see extra.py, keeps the graph source lines above unchanged)
+extra.install(globals())
 for run in range(int(os.environ.get("LTX_RUNS", "1"))):
     # LTX_RUNS=N: N generations in one process; the DiT is built and compiled once, so runs after the first are warm
     T.clear(); N.clear()
@@ -702,3 +704,4 @@ for run in range(int(os.environ.get("LTX_RUNS", "1"))):
         for k in T:
             print(f"[STAGE] run {run} {k}: {T[k] * 1000:.0f} ms over {N[k]} calls", flush=True)
         print(f"[STAGE] run {run} total: {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
+    extra.report(rank)
