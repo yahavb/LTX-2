@@ -16,12 +16,12 @@ cv = dict(upsample_initial_channel=64, resblock="AMP1", upsample_rates=[5, 2, 2,
           resblock_dilation_sizes=[[1, 3, 5]] * 3, activation="snakebeta", use_tanh_at_final=False, use_bias_at_final=False)
 cb = dict(cv, upsample_initial_channel=32, upsample_rates=[6, 5, 2, 2, 2], upsample_kernel_sizes=[12, 11, 4, 4, 4],
           apply_final_activation=False)
-m = V.VocoderWithBWE(V.Vocoder(**cv), V.Vocoder(**cb), V.MelSTFT(512, 80, 512, 64), 16000, 48000, 80).double()
+m = V.VocoderWithBWE(V.Vocoder(**cv), V.Vocoder(**cb), V.MelSTFT(512, 80, 512, 64), 16000, 48000, 80).float()
 with torch.no_grad():
     for p in m.parameters():
         p.normal_(0, 0.05)
     m.mel_stft.mel_basis.uniform_(0, 0.1); m.mel_stft.stft_fn.forward_basis.normal_(0, 0.05)
-mel = torch.randn(1, 2, 104, 64, dtype=torch.float64)
+mel = torch.randn(1, 2, 104, 64)
 with torch.no_grad():
     ref = m(mel)
 rt = ns   # the up/down forwards read _rep_pad from this namespace, as run_tp's do from run_tp's globals
