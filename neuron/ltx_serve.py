@@ -204,6 +204,8 @@ def main(rt):
                     job.events.put({"chunk": k, "mp4": base64.b64encode(open(out, "rb").read()).decode(),
                                     "gen_s": round(s, 3)})
             k += 1
+            if role == "dit":
+                rt["_DIT"]["throttle"]()
             go = _bcast(rank == 0 and live and not job.stop.is_set(), rank)
             if not go:
                 break
@@ -319,6 +321,24 @@ def _dit_hooks(rt, fps):  # noqa: C901
             state["inflight"] += 1
         sendq.put((pending.pop("body"), job, k, gen_s))
 
+    def throttle():
+        """Backpressure: at most LTX_MAX_INFLIGHT chunks (default 2) sent and not yet decoded. Without it the DiT ran
+        hundreds of chunks ahead of a slower VAE (unbounded latency and memory). All ranks call it, same beats as
+        drain()."""
+        cap = int(os.environ.get("LTX_MAX_INFLIGHT", "2"))
+        if rank == 0:
+            while True:
+                with lock:
+                    if state["inflight"] >= cap:
+                        lock.wait(30)
+                    busy = state["inflight"] >= cap
+                _bcast(busy, rank)
+                if not busy:
+                    return
+        else:
+            while _bcast(None, rank):
+                pass
+
     def drain():
         """Wait until every sent chunk is decoded. All ranks call it: rank 0 broadcasts a heartbeat every 30 s while it
         waits (the VAE pod's first decodes compile for a long time), then a stop; the other ranks follow the beats."""
@@ -339,7 +359,7 @@ def _dit_hooks(rt, fps):  # noqa: C901
 
     D.decode_chunks = decode_chunks
     D.encode_media_segments = encode_media_segments
-    rt["_DIT"] = {"emit_to": emit_to, "drain": drain}
+    rt["_DIT"] = {"emit_to": emit_to, "drain": drain, "throttle": throttle}
 
 
 def _vae_loop(rt, base, fps, decodes, out):
