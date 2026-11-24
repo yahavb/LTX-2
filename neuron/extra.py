@@ -86,9 +86,15 @@ import torch.distributed._functional_collectives as funcol  # noqa: E402
 _AS = {"on": False, "t": 1, "v": 1}
 
 
-def _side(x, left, right, mode):
+def _side(x, left, right, mode, kind=""):
     """[prev rank's last `left` samples, x, next rank's first `right` samples] (stock padding at the borders)."""
     g, i, grp = _AS["g"], _AS["i"], _AS["group"]
+    if kind and kind in os.environ.get("LTX_VOC_NOHALO", ""):   # compile bisect only: local padding, not exact
+        pad = [x[..., :1].expand(*x.shape[:-1], left)] if (left and mode == "replicate") else \
+            ([x.new_zeros(*x.shape[:-1], left)] if left else [])
+        post = [x[..., -1:].expand(*x.shape[:-1], right)] if (right and mode == "replicate") else \
+            ([x.new_zeros(*x.shape[:-1], right)] if right else [])
+        return torch.cat(pad + [x] + post, dim=-1)
     L = x.shape[-1]
     valid = L * _AS["v"] // _AS["t"]
     if valid < L:
@@ -131,7 +137,7 @@ def _install_voc_split(rt, g):
             return conv1d_fwd(self, x)
         assert self.padding_mode == "zeros" and self.stride[0] == 1
         p = self.padding[0]
-        return F.conv1d(_side(x, p, p, "zeros"), self.weight, self.bias, 1, 0, self.dilation, self.groups)
+        return F.conv1d(_side(x, p, p, "zeros", "conv"), self.weight, self.bias, 1, 0, self.dilation, self.groups)
 
     def convt(self, x):
         if not (_AS["on"] and getattr(self, "_vs", False)):
@@ -140,7 +146,7 @@ def _install_voc_split(rt, g):
         assert self.output_padding[0] == 0 and self.dilation[0] == 1
         h = -(-k // s) + 1
         L = x.shape[-1]
-        z = F.conv_transpose1d(_side(x, h, h, "zeros"), self.weight, self.bias, s, 0, 0, self.groups)
+        z = F.conv_transpose1d(_side(x, h, h, "zeros", "convt"), self.weight, self.bias, s, 0, 0, self.groups)
         st = h * s + pp
         return z[..., st:st + L * s]
 
@@ -153,7 +159,7 @@ def _install_voc_split(rt, g):
         def f(self, x):
             if not _AS["on"]:
                 return fwd(self, x)
-            rt["_rep_pad"] = lambda t, l, r: _side(t, l, r, "replicate")   # the stock pad, from the neighbours
+            rt["_rep_pad"] = lambda t, l, r: _side(t, l, r, "replicate", "updown")   # the stock pad, from the neighbours
             try:
                 return fwd(self, x)
             finally:
@@ -167,7 +173,7 @@ def _install_voc_split(rt, g):
         if y.dim() == 2:
             y = y.unsqueeze(1)
         left = max(0, self.win_length - self.hop_length)
-        y = _side(y, left, 0, "zeros")
+        y = _side(y, left, 0, "zeros", "stft")
         spec = F.conv1d(y, self.forward_basis, stride=self.hop_length, padding=0)
         n = spec.shape[1] // 2
         real, imag = spec[:, :n], spec[:, n:]
