@@ -159,7 +159,7 @@ def shard_transformer(model: torch.nn.Module, rank: int, world: int, group=None)
         return model
     n_att = n_ff = 0
     for name, m in list(model.named_modules()):
-        if "transformer_blocks" not in name:
+        if "transformer_blocks" not in name or _keep_full(name):
             continue
         if isinstance(m, Attention):
             _shard_attention(m, rank, world, group)
@@ -315,3 +315,13 @@ def enable_sequence_parallel(model: torch.nn.Module, rank: int, world: int, grou
             vm._process_transformer_blocks = pbw
     if rank == 0:
         print(f"[tp] video sequence parallel over {world} ranks", flush=True)
+
+
+def _keep_full(name: str) -> bool:
+    """LTX_AUDIO_REPLICATE=1: the audio stream's own attention / FF stay whole on every rank. The audio stream has 26
+    tokens: split 16 ways it costs ~336 collectives per DiT step (stage-1 pair: 1202 collectives, ~28 ms active) for
+    almost no compute. Replicated, the same math runs locally (~7 GB more weights per rank). Defined at the end of the
+    file so the graph code above keeps its source lines."""
+    if os.environ.get("LTX_AUDIO_REPLICATE", "0") != "1":
+        return False
+    return name.rsplit(".", 1)[-1] in ("audio_attn1", "audio_attn2", "audio_ff")
