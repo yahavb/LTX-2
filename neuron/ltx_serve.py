@@ -386,6 +386,34 @@ def _vae_loop(rt, base, fps, decodes, out):
         enc(segs, fps=obj["fps"], output_path=out, video_chunks_number=None)
         return open(out, "rb").read() if rank == 0 else b""
 
+    # LTX_VAE_ASYNC_ENCODE=1: the device decode on the main thread (every rank), the H.264 / AAC mux on rank-0 worker
+    # threads (LTX_VAE_ENC_THREADS, default 2), so the next chunk's decode overlaps this chunk's encode (the encode,
+    # ~0.55 s of host time, was most of the VAE pod's 1.2 s round trip). Exact: the same frames go to the same encoder.
+    async_enc = os.environ.get("LTX_VAE_ASYNC_ENCODE", "0") == "1"
+    encq = queue.Queue()
+
+    def enc_worker(i):
+        while True:
+            segs, efps, box = encq.get()
+            path = f"/tmp/ltx_vae_enc{i}.mp4"
+            try:
+                enc(iter(segs), fps=efps, output_path=path, video_chunks_number=None)
+                box["mp4"] = open(path, "rb").read()
+            except Exception as e:  # noqa: BLE001
+                box["error"] = f"encode failed: {e}"
+            box["done"].set()
+
+    if async_enc and rank == 0:
+        for i in range(int(os.environ.get("LTX_VAE_ENC_THREADS", "2"))):
+            threading.Thread(target=enc_worker, args=(i,), daemon=True).start()
+
+    def decode_async(body, box):
+        obj = torch.load(io.BytesIO(body), weights_only=False)
+        segs = list(D.decode_chunks(iter([obj["chunk"]]), pipe.video_decoder, pipe.audio_decoder, fps=obj["fps"],
+                                    tiling_config=None, generator=None, dtype=torch.bfloat16, keyframes=False))
+        if rank == 0:
+            encq.put((segs, obj["fps"], box))
+
     warm = os.environ.get("LTX_VAE_WARM")          # optional: a pickled chunk to decode at startup
     if warm and os.path.exists(warm):
         for i in range(2):
@@ -400,6 +428,15 @@ def _vae_loop(rt, base, fps, decodes, out):
         item = _poll(decodes) if rank == 0 else None
         body = _bcast(None if item is None else item[0], rank)
         if body is None:               # idle heartbeat
+            continue
+        if async_enc:
+            try:
+                decode_async(body, item[1] if rank == 0 else None)
+            except Exception as e:  # noqa: BLE001
+                if rank == 0:
+                    item[1]["error"] = str(e)
+                    item[1]["done"].set()
+                print(f"[SERVE] decode failed on rank {rank}: {e}", flush=True)
             continue
         try:
             mp4 = decode(body)
