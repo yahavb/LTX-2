@@ -155,16 +155,25 @@ def main(rt):
 
     if role == "dit":
         _dit_hooks(rt, fps)
+    enc_async = role == "colo" and os.environ.get("LTX_ASYNC_ENCODE", "0") == "1"
+    if enc_async:
+        _async_encode_hooks(rt)
+    stage_log = os.environ.get("LTX_STAGE_LOG", "0") == "1"
 
     def chunk(prompt, seed):
         sys.argv = _argv(base, prompt, seed, out)
+        rt["T"].clear(); rt["N"].clear()
         t0 = time.perf_counter()
         D.main()
         if role == "dit":
             # rank 0 alone copies the latents to host after the DiT; keep the other ranks from racing into the next
             # chunk's collectives meanwhile (that mismatch failed the stage-2 all-reduce: "Invalid NEFF")
             _bcast(None, rank)
-        return time.perf_counter() - t0
+        s = time.perf_counter() - t0
+        if stage_log and rank == 0:
+            print("[STAGE] " + " ".join(f"{k.split()[0]}={v * 1e3:.0f}" for k, v in rt["T"].items()) +
+                  f" total={s * 1e3:.0f}", flush=True)
+        return s
 
     warm = os.environ.get("LTX_WARMUP_PROMPT", "A red fox walks through fresh snow in a quiet pine forest at dawn.")
     for i in range(int(os.environ.get("LTX_WARMUP_RUNS", "3"))):   # run 0 compiles, run 1 recompiles once
@@ -189,6 +198,8 @@ def main(rt):
             if rank == 0:
                 if role == "dit":
                     rt["_DIT"]["emit_to"](job, k, s)
+                elif enc_async:
+                    rt["_ENC"]["emit_to"](job, k, s)
                 else:
                     job.events.put({"chunk": k, "mp4": base64.b64encode(open(out, "rb").read()).decode(),
                                     "gen_s": round(s, 3)})
@@ -198,9 +209,59 @@ def main(rt):
                 break
         if role == "dit":
             rt["_DIT"]["drain"]()
+        if enc_async and rank == 0:
+            rt["_ENC"]["drain"]()
         if rank == 0:
             job.events.put({"done": True, "chunks": k})
             job.events.put(None)
+
+
+def _async_encode_hooks(rt):
+    """colo with LTX_ASYNC_ENCODE=1 (the fair co-located baseline: the same overlap the disagg VAE pod gives the DiT
+    pod's host): the decoders run on the main thread as before (device work, all ranks), the mp4 mux / H.264 encode
+    of the decoded frames and audio runs on one rank-0 worker thread while the next chunk denoises. Exact: the same
+    frames and audio go to the same encoder."""
+    D, rank = rt["D"], rt["rank"]
+    enc = rt["_enc"]
+    q, state, lock = queue.Queue(), {"inflight": 0}, threading.Condition()
+    pending = {}
+
+    def worker():
+        while True:
+            segs, kw, job, k, gen_s = q.get()
+            path = f"/tmp/ltx_chunk_a{k % 4}.mp4"
+            try:
+                enc(iter(segs), **{**kw, "output_path": path})
+                ev = {"chunk": k, "mp4": base64.b64encode(open(path, "rb").read()).decode(), "gen_s": round(gen_s, 3)}
+            except Exception as e:  # noqa: BLE001
+                ev = {"error": f"encode failed: {e}"}
+            if job is not None:
+                job.events.put(ev)
+            with lock:
+                state["inflight"] -= 1
+                lock.notify_all()
+
+    if rank == 0:
+        threading.Thread(target=worker, daemon=True).start()
+
+    def encode_media_segments(segments, **kw):
+        segs = list(segments)                     # runs the video / audio decoders here (device, every rank)
+        if rank == 0:
+            pending["item"] = (segs, kw)
+
+    def emit_to(job, k, gen_s):
+        with lock:
+            state["inflight"] += 1
+        segs, kw = pending.pop("item")
+        q.put((segs, kw, job, k, gen_s))
+
+    def drain():
+        with lock:
+            while state["inflight"]:
+                lock.wait(5)
+
+    D.encode_media_segments = encode_media_segments
+    rt["_ENC"] = {"emit_to": emit_to, "drain": drain}
 
 
 def _dit_hooks(rt, fps):  # noqa: C901
