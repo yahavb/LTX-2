@@ -160,13 +160,17 @@ def main(rt):
         sys.argv = _argv(base, prompt, seed, out)
         t0 = time.perf_counter()
         D.main()
+        if role == "dit":
+            # rank 0 alone copies the latents to host after the DiT; keep the other ranks from racing into the next
+            # chunk's collectives meanwhile (that mismatch failed the stage-2 all-reduce: "Invalid NEFF")
+            _bcast(None, rank)
         return time.perf_counter() - t0
 
     warm = os.environ.get("LTX_WARMUP_PROMPT", "A red fox walks through fresh snow in a quiet pine forest at dawn.")
     for i in range(int(os.environ.get("LTX_WARMUP_RUNS", "3"))):   # run 0 compiles, run 1 recompiles once
         s = chunk(warm, 42)
         if role == "dit":
-            rt["_DIT"]["drain"]()
+            rt["_DIT"]["drain"]()          # the VAE pod compiles on the first decodes: rank 0 waits, all ranks beat
         if rank == 0:
             print(f"[SERVE] warmup {i}: {s:.1f} s", flush=True)
     if rank == 0:
@@ -199,7 +203,7 @@ def main(rt):
             job.events.put(None)
 
 
-def _dit_hooks(rt, fps):
+def _dit_hooks(rt, fps):  # noqa: C901
     """dit role: the chunk generator's decode step ships the chunk (latents) to the VAE pod instead (rank 0, on a
     worker thread, so the next chunk's denoising overlaps the decode); the mp4 the VAE returns goes to the session."""
     import httpx
@@ -248,13 +252,22 @@ def _dit_hooks(rt, fps):
         sendq.put((pending.pop("body"), job, k, gen_s))
 
     def drain():
-        if rank != 0:
-            return
-        if "body" in pending:              # warmup chunks: decode them too (compiles / warms the VAE pod)
-            emit_to(None, -1, 0.0)
-        with lock:
-            while state["inflight"]:
-                lock.wait(1)
+        """Wait until every sent chunk is decoded. All ranks call it: rank 0 broadcasts a heartbeat every 30 s while it
+        waits (the VAE pod's first decodes compile for a long time), then a stop; the other ranks follow the beats."""
+        if rank == 0:
+            if "body" in pending:          # warmup chunks: decode them too (compiles / warms the VAE pod)
+                emit_to(None, -1, 0.0)
+            while True:
+                with lock:
+                    if state["inflight"]:
+                        lock.wait(30)
+                    busy = state["inflight"] > 0
+                _bcast(busy, rank)
+                if not busy:
+                    return
+        else:
+            while _bcast(None, rank):
+                pass
 
     D.decode_chunks = decode_chunks
     D.encode_media_segments = encode_media_segments
