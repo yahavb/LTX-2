@@ -142,6 +142,8 @@ def main(rt):
     rank, world = rt["rank"], rt["world"]
     D, move = rt["D"], rt["_move"]
     role = os.environ.get("LTX_ROLE", "colo")
+    import extra2
+    extra2.install(rt)
     base = shlex.split(os.environ["LTX_ARGS"])
     fps = float(base[base.index("--frame-rate") + 1]) if "--frame-rate" in base else 24.0
     jobs, decodes = Jobs(), queue.Queue()
