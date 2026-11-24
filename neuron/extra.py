@@ -187,6 +187,11 @@ def _install_voc_split(rt, g):
         finally:
             _AS["on"] = False
         b, c, L = y.shape
+        if os.environ.get("LTX_VOC_GATHER", "time") == "time":
+            # gather along the time axis directly (no output permute: the permute form hit NCC_IIIT901
+            # InsertIOTransposes "invalid split of dag" in the compiler)
+            a = funcol.all_gather_tensor(y.reshape(b * c, L).contiguous(), 1, _AS["group"])   # [B*C, g*L]
+            return a.reshape(b, c, g * L)[..., :T * (L // t)]
         a = funcol.all_gather_tensor(y.contiguous(), 0, _AS["group"])                # [g*B, C, L]
         return a.view(g, b, c, L).permute(1, 2, 0, 3).reshape(b, c, g * L)[..., :T * (L // t)]
     V.VocoderWithBWE.forward = bwe
