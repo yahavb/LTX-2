@@ -34,6 +34,8 @@ def install(rt):
                 dist.barrier()
             return m
         DS.DiffusionStage._build_transformer = staged
+    if int(os.environ.get("LTX_VOC_SPLIT", "0")) > 1 and rt["world"] > 1:
+        _install_voc_split(rt, int(os.environ["LTX_VOC_SPLIT"]))
     if os.environ.get("LTX_TE_FREE", "0") == "1":
         U = rt["U"]
         built = rt["_built"]
@@ -69,3 +71,123 @@ def report(rank):
     top = sorted(groups.items(), key=lambda kv: -kv[1][1])[:6]
     print(f"[MEM] rss {rss:.1f} GB; cpu tensors: " +
           ", ".join(f"{k[0]}/{k[1]}d x{c} {b / 2**30:.1f}GB" for k, (c, b) in top), flush=True)
+
+
+# ---------------- LTX_VOC_SPLIT=G: the vocoder split along time over G ranks ----------------
+# The trace of the l-lnc2 baseline: the vocoder + BWE graph is 382 ms, run whole on every rank. Its only cross-time
+# ops are the padded Conv1d / ConvTranspose1d, the anti-alias up/down filters (replicate padding), and the causal
+# STFT left pad; everything else is pointwise. Split along time, each of those ops takes its halo from the
+# neighbouring ranks (one all-gather per side) and keeps the stock padding at the true borders, so every rank computes
+# exactly its slice of the stock output. The mel input is cut into G equal slices (ranks i, i+G, ... repeat the same
+# slice); the slices are gathered at the end.
+import torch.nn.functional as F  # noqa: E402
+import torch.distributed._functional_collectives as funcol  # noqa: E402
+
+_AS = {"on": False}
+
+
+def _side(x, left, right, mode):
+    """[prev rank's last `left` samples, x, next rank's first `right` samples] (stock padding at the borders)."""
+    g, i, grp = _AS["g"], _AS["i"], _AS["group"]
+    parts = []
+    if left:
+        a = funcol.all_gather_tensor(x[..., -left:].contiguous(), 0, grp)          # [g*B, C, left]
+        b = x.shape[0]
+        if i > 0:
+            parts.append(a[(i - 1) * b:i * b])
+        elif mode == "replicate":
+            parts.append(x[..., :1].expand(*x.shape[:-1], left))
+        else:
+            parts.append(x.new_zeros(*x.shape[:-1], left))
+    parts.append(x)
+    if right:
+        a = funcol.all_gather_tensor(x[..., :right].contiguous(), 0, grp)
+        b = x.shape[0]
+        if i < g - 1:
+            parts.append(a[(i + 1) * b:(i + 2) * b])
+        elif mode == "replicate":
+            parts.append(x[..., -1:].expand(*x.shape[:-1], right))
+        else:
+            parts.append(x.new_zeros(*x.shape[:-1], right))
+    return torch.cat(parts, dim=-1)
+
+
+def _install_voc_split(rt, g):
+    dist, rank, world = rt["dist"], rt["rank"], rt["world"]
+    from ltx_core.model.audio_vae import vocoder as V
+    groups = [dist.new_group(list(range(j, min(j + g, world)))) for j in range(0, world, g)]
+    _AS.update(g=g, i=rank % g, group=groups[rank // g])
+    conv1d_fwd, convt_fwd = torch.nn.Conv1d.forward, torch.nn.ConvTranspose1d.forward
+
+    def conv1d(self, x):
+        if not (_AS["on"] and getattr(self, "_vs", False)) or self.padding[0] == 0:
+            return conv1d_fwd(self, x)
+        assert self.padding_mode == "zeros" and self.stride[0] == 1
+        p = self.padding[0]
+        return F.conv1d(_side(x, p, p, "zeros"), self.weight, self.bias, 1, 0, self.dilation, self.groups)
+
+    def convt(self, x):
+        if not (_AS["on"] and getattr(self, "_vs", False)):
+            return convt_fwd(self, x)
+        s, k, pp = self.stride[0], self.kernel_size[0], self.padding[0]
+        assert self.output_padding[0] == 0 and self.dilation[0] == 1
+        h = -(-k // s) + 1
+        L = x.shape[-1]
+        z = F.conv_transpose1d(_side(x, h, h, "zeros"), self.weight, self.bias, s, 0, 0, self.groups)
+        st = h * s + pp
+        return z[..., st:st + L * s]
+
+    torch.nn.Conv1d.forward, torch.nn.ConvTranspose1d.forward = conv1d, convt
+    up_fwd, lp_fwd, stft_fwd, bwe_fwd = V.UpSample1d.forward, V.LowPassFilter1d.forward, V._STFTFn.forward, \
+        V.VocoderWithBWE.forward
+    rep_pad = rt["_rep_pad"]
+
+    def with_halo(fwd):
+        def f(self, x):
+            if not _AS["on"]:
+                return fwd(self, x)
+            rt["_rep_pad"] = lambda t, l, r: _side(t, l, r, "replicate")   # the stock pad, from the neighbours
+            try:
+                return fwd(self, x)
+            finally:
+                rt["_rep_pad"] = rep_pad
+        return f
+    V.UpSample1d.forward, V.LowPassFilter1d.forward = with_halo(up_fwd), with_halo(lp_fwd)
+
+    def stft(self, y):
+        if not _AS["on"]:
+            return stft_fwd(self, y)
+        if y.dim() == 2:
+            y = y.unsqueeze(1)
+        left = max(0, self.win_length - self.hop_length)
+        y = _side(y, left, 0, "zeros")
+        spec = F.conv1d(y, self.forward_basis, stride=self.hop_length, padding=0)
+        n = spec.shape[1] // 2
+        real, imag = spec[:, :n], spec[:, n:]
+        return torch.sqrt(real ** 2 + imag ** 2), torch.atan2(imag.float(), real.float()).to(real.dtype)
+    V._STFTFn.forward = stft
+
+    def bwe(self, mel_spec):
+        T = mel_spec.shape[2]
+        assert T % g == 0, f"{T} mel frames over {g} ranks"
+        t = T // g
+        _AS["on"] = True
+        try:
+            y = bwe_fwd(self, mel_spec[:, :, _AS["i"] * t:(_AS["i"] + 1) * t])         # [B, C, L]
+        finally:
+            _AS["on"] = False
+        b, c, L = y.shape
+        a = funcol.all_gather_tensor(y.contiguous(), 0, _AS["group"])                # [g*B, C, L]
+        return a.view(g, b, c, L).permute(1, 2, 0, 3).reshape(b, c, g * L)
+    V.VocoderWithBWE.forward = bwe
+
+    ADm = rt["ADm"]
+    call = ADm.AudioDecoder.__call__
+
+    def ad_call(self, latent):
+        voc = self._vocoder_builder.build(device=rt["dit_device"], dtype=torch.float32)   # memoized: the one compiled
+        for m in voc.modules():
+            if isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
+                m._vs = True
+        return call(self, latent)
+    ADm.AudioDecoder.__call__ = ad_call
