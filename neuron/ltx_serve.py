@@ -77,8 +77,11 @@ def _http_server(role, jobs, decodes):
             body = await request.body()
             box = {"done": threading.Event()}
             decodes.put((body, box))
-            while not box["done"].wait(0.05):
-                pass
+            # wait off the event loop: a blocking wait here held uvicorn's only loop, so the pod read the next request
+            # only after this one's mp4 was sent (one chunk at a time end to end, ~1 chunk/s with the main thread
+            # idle half the time under 3 streams)
+            import asyncio
+            await asyncio.get_running_loop().run_in_executor(None, box["done"].wait)
             if "error" in box:
                 raise HTTPException(500, box["error"])
             return Response(box["mp4"], media_type="video/mp4")
