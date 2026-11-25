@@ -410,12 +410,21 @@ def _vae_loop(rt, base, fps, decodes, out):
         for i in range(int(os.environ.get("LTX_VAE_ENC_THREADS", "2"))):
             threading.Thread(target=enc_worker, args=(i,), daemon=True).start()
 
+    stage_log = os.environ.get("LTX_STAGE_LOG", "0") == "1"
+
     def decode_async(body, box):
+        t0 = time.perf_counter()
+        rt["T"].clear()
         obj = torch.load(io.BytesIO(body), weights_only=False)
+        t1 = time.perf_counter()
         segs = list(D.decode_chunks(iter([obj["chunk"]]), pipe.video_decoder, pipe.audio_decoder, fps=obj["fps"],
                                     tiling_config=None, generator=None, dtype=torch.bfloat16, keyframes=False))
+        t2 = time.perf_counter()
         if rank == 0:
             encq.put((segs, obj["fps"], box))
+            if stage_log:
+                print(f"[VSTAGE] load={1e3 * (t1 - t0):.0f} decode={1e3 * (t2 - t1):.0f} " +
+                      " ".join(f"{k}={v * 1e3:.0f}" for k, v in rt["T"].items()) + f" q={decodes.qsize()}", flush=True)
 
     warm = os.environ.get("LTX_VAE_WARM")          # optional: a pickled chunk to decode at startup
     if warm and os.path.exists(warm):
