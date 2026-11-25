@@ -24,6 +24,25 @@ def _clone(obj):
 
 
 def install(rt):
+    if os.environ.get("LTX_VAE_RGB_GRAPH", "0") == "1":
+        # the conv VAE's to_rgb (permute c f h w -> f h w c, then in-place add / mul / clamp) ran as eager device ops on
+        # the 116 MB decoded video, and the host copy then read a permuted (strided) tensor. One compiled graph instead,
+        # contiguous [f, h, w, c] output (rules: make irregular access regular, fewer DMAs). Same elementwise ops.
+        import functools
+        from ltx_core.model.video_vae import conv_video_decoder as CVD
+
+        def _rgb(frames):
+            return (frames[0].permute(1, 2, 3, 0) + 1.0).mul(0.5).clamp(0.0, 1.0).contiguous()
+        rgb = torch.compile(_rgb, backend="neuron", dynamic=False, fullgraph=True)
+        dv = CVD.ConvVideoDecoder.decode_video
+
+        @functools.wraps(dv)
+        def decode_video(self, latent, tiling_config=None, generator=None, **kw):
+            if tiling_config is not None or rt["dit_device"].type != "neuron":
+                yield from dv(self, latent, tiling_config, generator, **kw)
+                return
+            yield rgb(self(latent, generator=generator))
+        CVD.ConvVideoDecoder.decode_video = decode_video
     gs = int(os.environ.get("LTX_VAE_SPLIT_RANKS", rt["world"]))
     if gs < rt["world"]:
         # LTX_VAE_SPLIT_RANKS=G (G < world, e.g. TP32 with the 16-rank 2x8 VAE grid, the only grid that fits SBUF at
