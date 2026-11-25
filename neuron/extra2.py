@@ -24,6 +24,12 @@ def _clone(obj):
 
 
 def install(rt):
+    gs = int(os.environ.get("LTX_VAE_SPLIT_RANKS", rt["world"]))
+    if gs < rt["world"]:
+        # LTX_VAE_SPLIT_RANKS=G (G < world, e.g. TP32 with the 16-rank 2x8 VAE grid, the only grid that fits SBUF at
+        # 49 frames): world/G rank groups each decode the full latent (same result in every group)
+        dist = rt["dist"]
+        rt["_VGROUPS"] = [dist.new_group(list(range(k, k + gs))) for k in range(0, rt["world"], gs)]
     if os.environ.get("LTX_STATE_CACHE", "0") == "1":
         from ltx_core import tools as TL
         for cls in (TL.VideoLatentTools, TL.AudioLatentTools):

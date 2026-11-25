@@ -613,9 +613,9 @@ def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
         dec = self._prepared_builder().build(device=dit_device, dtype=torch.bfloat16).eval()
         dec = disable_memory_efficient_decode(dec)
         if os.environ.get("LTX_VAE_SPLIT", "0") == "1" and world > 1:
-            gh = int(os.environ.get("LTX_VAE_GRID_H", "4")); gw = world // gh
-            assert gh * gw == world
-            _VSPLIT.update(group=dist.group.WORLD, gh=gh, gw=gw, i=rank // gw, j=rank % gw)
+            gs = int(os.environ.get("LTX_VAE_SPLIT_RANKS", world)); gh = int(os.environ.get("LTX_VAE_GRID_H", "4")); gw = gs // gh
+            assert gh * gw == gs and world % gs == 0, (gh, gw, gs, world)   # gs < world: world/gs groups decode the same latent
+            _VSPLIT.update(group=dist.group.WORLD if gs == world else _VGROUPS[rank // gs], gh=gh, gw=gw, i=rank % gs // gw, j=rank % gw)
             dec._orig_forward = dec.forward
             _sf = torch.compile(functools.partial(_split_decode, dec), backend="neuron", dynamic=False, fullgraph=_FG)
             dec.forward = lambda sample, timestep=None, generator=None, _sf=_sf: _sf(sample)
