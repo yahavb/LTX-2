@@ -24,7 +24,7 @@ dec._orig_forward = dec.forward
 f = torch.compile(functools.partial(ns["_split_decode"], dec), backend="neuron", dynamic=False, fullgraph=True)
 F = int(os.environ.get("FRAMES", "7"))
 torch.manual_seed(0)
-lat = torch.randn(1, 128, F, 16, 24, dtype=torch.bfloat16).to(dev)
+lat = torch.randn(1, 128, F, int(os.environ.get("LAT_H", "16")), int(os.environ.get("LAT_W", "24")), dtype=torch.bfloat16).to(dev)
 with torch.no_grad():
     t0 = time.time(); y = f(lat); y.cpu(); tc = time.time() - t0
     for _ in range(2):
