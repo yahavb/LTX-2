@@ -187,6 +187,11 @@ def main(rt):
             rt["_DIT"]["drain"]()          # the VAE pod compiles on the first decodes: rank 0 waits, all ranks beat
         if rank == 0:
             print(f"[SERVE] warmup {i}: {s:.1f} s", flush=True)
+    if os.environ.get("LTX_SKIP_GUARDS", "0") == "1":
+        # every graph is compiled and warm (static shapes): stop re-evaluating Dynamo guards on each call. py-spy on the
+        # DiT pod: guard evaluation ~10% of rank 0's main thread; the system trace: 224 ms of device idle between
+        # graphs per chunk. Exact: the same compiled graphs run (no recompiles are possible at these shapes).
+        torch.compiler.set_stance("default", skip_guard_eval_unsafe=True)
     if rank == 0:
         READY.set()
         print("[SERVE] ready", flush=True)
