@@ -628,7 +628,7 @@ def _vd_call(self, latent, tiling_config=None, generator=None, **kw):
         print(f"[LATENT] mean {lf.mean().item():.4f} std {lf.std().item():.4f} nan {int(torch.isnan(lf).sum())}", flush=True)
     with torch.no_grad():
         chunks = dec.decode_video(latent.to(dit_device, torch.bfloat16), None, generator)
-        return iter([c.cpu() for c in chunks])
+        return iter([c.cpu() if rank == 0 or os.environ.get("LTX_VAE_RANK0_HOST", "0") != "1" else c for c in chunks])
 
 
 VDm.VideoDecoder.__call__ = _vd_call
