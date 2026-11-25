@@ -476,9 +476,9 @@ def _split_decode(dec, latent):
     H, W = latent.shape[3], latent.shape[4]
     tile = latent[:, :, :, i * H // gh:(i + 1) * H // gh, j * W // gw:(j + 1) * W // gw]
     out = dec._orig_forward(tile)                                                           # [1,3,F,h,w]
-    allt = funcol.all_gather_tensor(out.contiguous(), 0, g["group"])                        # [world,3,F,h,w]
-    b, c, f, h, w = out.shape
-    allt = allt.view(gh, gw, c, f, h, w).permute(2, 3, 0, 4, 1, 5).reshape(1, c, f, gh * h, gw * w)
+    allt = funcol.all_gather_tensor(out.contiguous(), 0, g["group"])                        # [world*B,3,F,h,w]
+    b, c, f, h, w = out.shape                                                               # B > 1: batched chunks
+    allt = allt.view(gh, gw, b, c, f, h, w).permute(2, 3, 4, 0, 5, 1, 6).reshape(b, c, f, gh * h, gw * w)
     return allt
 
 
