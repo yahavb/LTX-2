@@ -24,6 +24,22 @@ def _clone(obj):
 
 
 def install(rt):
+    if os.environ.get("LTX_REUSE_PIPE", "0") == "1":
+        # D.main built a new DistilledPipeline (prompt encoder, stage, upsampler, decoders: builders + checks) for every
+        # chunk while the device idled at the chunk boundary. The pipeline keeps no per-run state (its __init__ is the
+        # only place it assigns attributes), so one instance per constructor arguments is reused. Exact.
+        import ltx_pipelines.distilled as DI
+        cls = DI.DistilledPipeline
+        made = {}
+
+        def pipeline(*a, **k):
+            key = repr((a, sorted(k.items())))
+            if key not in made:
+                made[key] = cls(*a, **k)
+                if rt["rank"] == 0:
+                    print(f"[REUSE] built pipeline #{len(made)}", flush=True)
+            return made[key]
+        DI.DistilledPipeline = pipeline
     if os.environ.get("LTX_HOST_MEMO", "0") == "1":
         # Per-chunk host work while the device idles (DiT pod trace: ~250 ms of gaps per chunk; py-spy: checkpoint
         # header JSON parse + safetensors safe_open on the 22B transformer every chunk). Both depend only on the file:
