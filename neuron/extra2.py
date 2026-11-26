@@ -24,6 +24,35 @@ def _clone(obj):
 
 
 def install(rt):
+    if os.environ.get("LTX_HOST_MEMO", "0") == "1":
+        # Per-chunk host work while the device idles (DiT pod trace: ~250 ms of gaps per chunk; py-spy: checkpoint
+        # header JSON parse + safetensors safe_open on the 22B transformer every chunk). Both depend only on the file:
+        # memoized by (path, size, mtime). Exact.
+        import functools as _ft
+        from ltx_core.loader import checkpoint as CK
+        from ltx_pipelines.utils import constants as CN
+        import ltx_pipelines.distilled as DI
+        rh = CK._read_header
+
+        @_ft.lru_cache(maxsize=None)
+        def _rh_key(path, size, mtime):
+            return rh(path)
+
+        def read_header(path):
+            st = os.stat(path)
+            return _rh_key(path, st.st_size, st.st_mtime_ns)
+        CK._read_header = read_header
+        dmv = CN.detect_model_version
+
+        @_ft.lru_cache(maxsize=None)
+        def _dmv_key(path, size, mtime):
+            return dmv(path)
+
+        def detect_model_version(path):
+            st = os.stat(path)
+            return _dmv_key(str(path), st.st_size, st.st_mtime_ns)
+        CN.detect_model_version = detect_model_version
+        DI.detect_model_version = detect_model_version
     if os.environ.get("LTX_VAE_RGB_GRAPH", "0") == "1":
         # the conv VAE's to_rgb (permute c f h w -> f h w c, then in-place add / mul / clamp) ran as eager device ops on
         # the 116 MB decoded video, and the host copy then read a permuted (strided) tensor. One compiled graph instead,
