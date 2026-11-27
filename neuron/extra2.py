@@ -29,13 +29,12 @@ def install(rt):
         # chunk while the device idled at the chunk boundary. The pipeline keeps no per-run state (its __init__ is the
         # only place it assigns attributes), so one instance per constructor arguments is reused. Exact.
         import ltx_pipelines.distilled as DI
-        cls = DI.DistilledPipeline
         made = {}
 
-        def pipeline(*a, **k):
+        def pipeline(*a, _cls=DI.DistilledPipeline, **k):   # bound now: a later loop in install() rebinds names
             key = repr((a, sorted(k.items())))
             if key not in made:
-                made[key] = cls(*a, **k)
+                made[key] = _cls(*a, **k)
                 if rt["rank"] == 0:
                     print(f"[REUSE] built pipeline #{len(made)}", flush=True)
             return made[key]
